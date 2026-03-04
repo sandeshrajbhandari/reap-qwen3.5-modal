@@ -1,8 +1,8 @@
-# Pruning the Giants: Shrinking Qwen 3.5 MoE with REAP and Modal
+# Pruning and High-Precision Quantization: Shrinking Qwen 3.5 MoE with REAP and Modal
 
 Mixture-of-Experts (MoE) models like Qwen 3.5 are the current gold standard for performance-to-compute efficiency. However, their massive weight files—often exceeding 70GB—make them a challenge for deployment on consumer hardware. 
 
-I recently completed a project to prune the **Qwen3.5-35B-A3B** model by 32%, resulting in a leaner, more efficient version: **Qwen3.5-24B-A3B-REAP-0.32**. This was achieved using the **REAP (Resource-Efficient Activation-based Pruning)** method, orchestrated entirely on Modal's serverless infrastructure.
+I recently completed a project to prune the **Qwen3.5-35B-A3B** model by 32%, resulting in a leaner version: **Qwen3.5-24B-A3B-REAP-0.32**. But I didn't stop at pruning. Using advanced GGUF quantization techniques, I've produced a highly optimized local-inference version that punches far above its weight class.
 
 ---
 
@@ -11,19 +11,24 @@ I recently completed a project to prune the **Qwen3.5-35B-A3B** model by 32%, re
 The standard REAP implementation was built for earlier MoE architectures. To support the cutting-edge Qwen 3.5 series, I created a fork of the REAP repository and developed the **[`feat/qwen3.5-moe-support`](https://github.com/sandeshrajbhandari/reap/tree/feat/qwen3.5-moe-support)** branch. 
 
 ### Key Technical Fixes in the Fork:
-1. **The "Gate" naming convention**: Standard MoE blocks in the original repo looked for a `.router` attribute. Qwen 3.5 uses `.gate`. I updated `src/reap/prune.py` to dynamically resolve the routing layer using `getattr(moe, "router", getattr(moe, "gate", None))`.
-2. **Handling Forward Pass Variations**: The REAP observer hook expected MoE blocks to return a tuple (output, router_logits). Qwen 3.5's `SparseMoeBlock` forward pass often returns a single tensor. I patched `src/reap/observer.py` to detect single-tensor returns and wrap them in a compatible tuple format, preventing the observer from crashing.
-3. **Dtype Mismatch in Metrics**: During the computation of similarity matrices, I encountered a `RuntimeError` in `scatter_add_`. Qwen 3.5 produces `bfloat16` activations, while the similarity matrix was `float32`. I implemented an explicit cast in `src/reap/metrics.py` to ensure `flat_dists.to(pairwise_distances.dtype)` before the scatter operation.
+1. **The "Gate" naming convention**: Updated `src/reap/prune.py` to resolve the routing layer using `getattr(moe, "router", getattr(moe, "gate", None))`.
+2. **Handling Forward Pass Variations**: Patched `src/reap/observer.py` to detect single-tensor returns from `SparseMoeBlock` and wrap them in compatible tuples.
+3. **Dtype Mismatch in Metrics**: Implemented explicit casting in `src/reap/metrics.py` to fix `RuntimeError` in `scatter_add_` during similarity computation.
 
 ---
 
-## Strategy for Fast Iteration
+## High-Precision Quantization: The Unsloth-Style Recipe
 
-Pruning a 35B model can be a slow, expensive process. To iterate quickly and overcome compute limitations, I used a "Minimalist Parameters" strategy:
+To ensure the pruned model didn't lose its "intelligence," I implemented a high-precision GGUF quantization pipeline based on the "Unsloth recipe."
 
-- **Ultra-Fast Sampling**: For the initial debug and verification runs, I set `--samples-per-category` to **1**. This allowed me to verify that the hooks were firing and the pruning logic was sound in under 5 minutes.
-- **Context Constraints**: I reduced the `model_max_length` from the standard 2048 to **1024**. This significantly lowered the VRAM overhead required to store activation tensors during the "Observer" phase.
-- **Record Pruning Metrics Only**: I enabled `record_pruning_metrics_only` to avoid saving unnecessary auxiliary data, keeping the Modal Volume usage lean.
+### 1. Importance Matrix (imatrix)
+I generated a custom **Importance Matrix** using `llama-imatrix` and a diverse calibration corpus. This tells the quantizer which weights are critical for reasoning, allowing it to prioritize precision for those specific parameters while compressing less important ones more aggressively.
+
+### 2. Custom Tensor Precision
+Instead of a uniform `Q4_K_M` quant, I used custom overrides to force critical components into **8-bit (`Q8_0`)**:
+- **Attention Gates & QKV**: Preserves the core attention mechanism accuracy.
+- **Shared Experts**: These are used in *every* token pass, so maintaining 8-bit precision is vital for stability.
+- **Token Embeddings**: Improves vocabulary comprehension and retrieval.
 
 ---
 
@@ -31,27 +36,19 @@ Pruning a 35B model can be a slow, expensive process. To iterate quickly and ove
 
 Hardware limitations are the primary bottleneck in LLM research. Here is how Modal made the impossible possible:
 
-### 1. Scaling the VRAM Wall
-Initial attempts on **L4 (24GB)** and **A100 (40GB)** GPUs hit `OutOfMemoryError` walls due to the sheer size of the 35B model plus the activation recording overhead. With Modal, upgrading to an **A100-80GB** was a single line change in my Python decorator: `@app.function(gpu="A100-80GB")`.
-
-### 2. The Persistent Caching Advantage
-By using **Modal Volumes**, I cached the 70GB+ Hugging Face weights. This meant that even if a run failed due to a code bug, the next iteration started instantly without re-downloading the model.
-
-### 3. The GGUF Conversion Trick
-To convert the final pruned model to **Q4_K_M GGUF**, I used `llama.cpp`. However, the converter didn't recognize the `Qwen3_5MoeForCausalLM` model type. Within the Modal container, I implemented a filesystem hack:
-- Automatically patched `config.json` to change the architecture to `Qwen3_5MoeForConditionalGeneration`.
-- Ran the conversion.
-- Restored the original metadata.
-- Uploaded the result to Hugging Face.
+- **Scaling the VRAM Wall**: Upgraded heavy profiling tasks to **A100-80GB** with a single line change.
+- **GGUF Filesystem Hacks**: Automatically patched `config.json` at runtime to trick `llama.cpp` into recognizing the new Qwen 3.5 architecture during conversion.
+- **Robust Sharded Uploads**: Developed a script to shard the 50GB+ Safetensors into 5GB pieces, ensuring reliable transfers to Hugging Face despite large file sizes.
 
 ---
 
 ## The Final Result
 
-The successfully pruned and quantized model is now available on Hugging Face. It represents a 32% reduction in expert count while maintaining the core capabilities of the Qwen 3.5 architecture.
+The successfully pruned and high-precision quantized models are now available on Hugging Face.
 
-- **Hugging Face Repository**: [sandeshrajx/qwen3.5-35b-reap-pruned-GGUF](https://huggingface.co/sandeshrajx/qwen3.5-35b-reap-pruned-GGUF)
-- **Primary Artifact**: `Qwen3.5-24B-A3B-REAP-0.32-Q4_K_M.gguf`
+- **Pruned Safetensors**: [sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32](https://huggingface.co/sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32)
+- **GGUF Master Repo**: [sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32-GGUF](https://huggingface.co/sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32-GGUF)
+- **Primary Artifact**: `Qwen3.5-24B-A3B-REAP-0.32-IQ4_K_M.gguf`
 - **Orchestration Scripts**: [sandeshrajbhandari/reap-qwen3.5-modal](https://github.com/sandeshrajbhandari/reap-qwen3.5-modal)
 
-*This project demonstrates that with the right pruning techniques, a focused fork of the REAP library, and a flexible serverless compute provider like Modal, we can make state-of-the-art MoE models accessible to everyone.*
+*This project demonstrates that with the right pruning techniques, high-precision quantization, and serverless compute, we can make state-of-the-art MoE models accessible to everyone.*

@@ -1,51 +1,44 @@
-# Project Progress Report: REAP Pruning on Modal
+# Project Progress Report: REAP Pruning and High-Precision Quantization on Modal
 
 ## Overview
-The goal of this project was to implement and execute the REAP (Resource-Efficient Activation-based Pruning) pipeline for large-scale Mixture-of-Experts (MoE) models using Modal's serverless infrastructure. We focused on two models: `openai/gpt-oss-20b` and `Qwen/Qwen3.5-35B-A3B`.
+The goal of this project was to implement and execute the REAP (Resource-Efficient Activation-based Pruning) pipeline for large-scale Mixture-of-Experts (MoE) models using Modal's serverless infrastructure, followed by high-precision GGUF quantization. We focused on `Qwen/Qwen3.5-35B-A3B`.
 
 ## Work Performed
 
 ### 1. Infrastructure Scaffolding
-- Developed `prune_gpt_oss.py` and `prune_qwen.py` to orchestrate the REAP pipeline on Modal.
-- Configured Modal Volumes (`hf-cache-reap` and `reap-results`) for persistent caching of model weights and pruning artifacts.
-- Implemented a four-step pipeline:
-    1. **Download**: Caching weights using `snapshot_download`.
-    2. **Observer**: Collecting activation statistics across dataset categories.
-    3. **Pruning**: Pruning experts based on collected statistics.
-    4. **Upload**: Automatically pushing the pruned model to Hugging Face.
+- Developed `prune_qwen.py` to orchestrate the REAP pipeline.
+- Developed `generate_imatrix.py` to build `llama.cpp` with CUDA support and generate Importance Matrices (imatrix).
+- Developed `quantize_modal_IQ.py` and `quantize_modal_IQS.py` for "Unsloth-style" high-precision quantization.
+- Configured Modal Volumes for persistent caching of weights, tools, and artifacts.
 
-### 2. Model Support
-- **GPT-OSS 20B**: Configured environment for MXFP4 dequantization support.
-- **Qwen 3.5 35B-A3B**: Integrated support for the new `qwen3_5_moe` architecture by installing `transformers` from source and patching the REAP codebase for Qwen-specific attributes.
+### 2. Pruning & Model Support
+- **Qwen 3.5 35B-A3B**: Integrated support for the `qwen3_5_moe` architecture.
+- Successfully pruned the model by 32% (uniformly across layers).
+- Patched REAP codebase for Qwen-specific attributes (`gate` vs `router`) and return types.
+
+### 3. High-Precision Quantization (GGUF)
+- **Importance Matrix**: Generated a 132MB `imatrix.dat` using a specific calibration corpus to preserve critical weights.
+- **Unsloth-style Recipe**: Implemented a custom quantization recipe that forces critical tensors (attention gates, shared experts, etc.) into 8-bit (`Q8_0`) while keeping routed experts at `Q4_K` or `Q5_K`.
+- **Multiple Variants**: Produced both `IQ4_K_M` and `IQ4_K_S` variants for optimal performance-to-size ratios.
 
 ## Challenges & Fixes
 
-### Environment & Dependency Management
-- **Challenge**: Local Python and Modal installations were not in the system path.
-  - **Fix**: Manually configured `$env:PATH` in the session to include the Windows Store Python distribution and local-packages Scripts folder.
-- **Challenge**: The REAP repository's `pyproject.toml` contained local path dependencies (e.g., `livecodebench`) that failed to resolve in the container.
-  - **Fix**: Implemented `sed` commands in the Modal image build to dynamically remove problematic dependencies and manually installed required core packages via `uv`.
-- **Challenge**: Missing system build tools for C-extensions (e.g., `zstandard`).
-  - **Fix**: Added `clang` and `cmake` to the `apt_install` list.
-
 ### Hardware & Memory (OOM)
-- **Challenge**: `L4` (24GB) and standard `A100` (40GB) GPUs hit `OutOfMemoryError` during model loading and dequantization.
-  - **Fix**: Upgraded memory-intensive functions to use `A100-80GB` GPUs.
-- **Challenge**: The observer phase hit OOM when processing activations at a context length of 2048.
-  - **Fix**: Reduced `model_max_length` to 1024 and enabled `record_pruning_metrics_only` to minimize the VRAM footprint of activation tensors.
+- **Challenge**: Standard A100 (40GB) hit OOM during 35B model loading and activation profiling.
+  - **Fix**: Upgraded all heavy tasks to **A100-80GB**.
+- **Challenge**: Context length of 2048 was too heavy for profiling.
+  - **Fix**: Reduced `model_max_length` to 1024.
 
-### Codebase Intercompatibility
-- **Challenge**: REAP observer expected MoE blocks to return a tuple, but Qwen 3.5 blocks return a single tensor.
-  - **Fix**: Patched `reap/observer.py` to handle both return types gracefully.
-- **Challenge**: Qwen 3.5 uses the attribute name `gate` instead of `router` for its MoE routing layer.
-  - **Fix**: Updated `reap/prune.py` to use `getattr(moe, "router", getattr(moe, "gate", None))`.
-- **Challenge**: PyTorch `scatter_add_` failed due to a dtype mismatch between `bfloat16` activations and `float32` similarity matrices.
-  - **Fix**: Patched `reap/metrics.py` to ensure explicit casting to the target dtype before the scatter operation.
+### GGUF Conversion & Quantization
+- **Challenge**: `llama.cpp` converter did not recognize `Qwen3_5MoeForCausalLM`.
+  - **Fix**: Implemented a temporary patch in `config.json` to change the architecture name to `Qwen3_5MoeForConditionalGeneration` during conversion.
+- **Challenge**: `llama-quantize` failed due to missing `libcudart.so` and `libllama.so`.
+  - **Fix**: Switched to a full CUDA-devel base image and configured `LD_LIBRARY_PATH` / `ldconfig` to correctly locate shared libraries in the volume.
 
-### Runtime Consistency
-- **Challenge**: Updates to the REAP repository were not always reflected in the Modal image due to caching.
-  - **Fix**: Implemented `sync_and_show_commit()` at the start of Modal functions to force a `git fetch` and `reset --hard` to the latest commit on the branch at runtime.
+### Upload & Reliability
+- **Challenge**: Uploading a single 50GB GGUF file was slow and prone to failure.
+  - **Fix**: Implemented a sharding script (`upload_to_hf.py`) to split the model into 5GB pieces for robust Hugging Face transfers.
 
 ## Final Status
-- **Qwen3.5-35B-A3B**: Successfully pruned (32% compression) and uploaded to [sandeshrajx/qwen3.5-35b-reap-pruned](https://huggingface.co/sandeshrajx/qwen3.5-35b-reap-pruned).
-- **GPT-OSS 20B**: Infrastructure is fully verified; observer data is collected and persisted in the `reap-results` volume.
+- **Pruned Model**: Successfully uploaded sharded Safetensors to [sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32](https://huggingface.co/sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32).
+- **GGUF Master Repo**: Consolidated F16, imatrix, and IQ quants at [sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32-GGUF](https://huggingface.co/sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32-GGUF).
