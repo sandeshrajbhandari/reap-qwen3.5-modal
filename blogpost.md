@@ -52,5 +52,6 @@ The successfully pruned and quantized model is now available on Hugging Face. It
 
 - **Hugging Face Repository**: [sandeshrajx/qwen3.5-35b-reap-pruned-GGUF](https://huggingface.co/sandeshrajx/qwen3.5-35b-reap-pruned-GGUF)
 - **Primary Artifact**: `Qwen3.5-24B-A3B-REAP-0.32-Q4_K_M.gguf`
+- **Orchestration Scripts**: [sandeshrajbhandari/reap-qwen3.5-modal](https://github.com/sandeshrajbhandari/reap-qwen3.5-modal)
 
-*This project demonstrates that with the right pruning techniques and a flexible serverless compute provider like Modal, we can make state-of-the-art MoE models accessible to everyone.*
+*This project demonstrates that with the right pruning techniques, a focused fork of the REAP library, and a flexible serverless compute provider like Modal, we can make state-of-the-art MoE models accessible to everyone.*
