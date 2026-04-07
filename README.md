@@ -41,13 +41,15 @@ modal run quantize_modal_IQ.py --hf-repo username/model-GGUF
 
 ```bash
 modal run quantize_modal_IQ3_S.py \
-  --model-subpath "Qwen3.5-122B-A10B/<your-run>/pruned_models/<your-pruned-model>" \
+  --hf-source-repo "sandeshrajx/qwen3.5b-24b-a10b" \
   --output-filename "Qwen3.5-122B-A10B-<tag>-IQ3_S.gguf" \
+  --generate-imatrix-if-missing true \
   --mmproj-quant "f16" \
   --hf-repo username/model-IQ3S-GGUF
 ```
 
 For multimodal checkpoints, keep/use a matching `mmproj` file. The script now handles this flow:
+- can pull source checkpoint directly from Hugging Face via `--hf-source-repo`;
 - uses existing `mmproj-f16.gguf` if present;
 - or auto-generates it via `convert_hf_to_gguf.py --mmproj`;
 - optional projector quantization via `--mmproj-quant` (default `f16`).
