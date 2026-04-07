@@ -59,6 +59,7 @@ This repository contains the following artifacts:
 - **`model-f16.gguf`**: The full-precision GGUF conversion of the pruned model.
 - **`Qwen3.5-24B-A3B-REAP-0.32-IQ4_K_M.gguf`**: High-precision 4-bit quant using the Unsloth-style recipe (imatrix + Q8_0 overrides for critical tensors).
 - **`Qwen3.5-24B-A3B-REAP-0.32-IQ4_K_S.gguf`**: Smaller 4-bit quant variant.
+- **`<model>-IQ3_S.gguf`**: Multimodal-aware `IQ3_S` quant using explicit tensor overrides (`ffn_down_exps=IQ3_S`, `ffn_gate_exps/ffn_up_exps=IQ2_S`, plus `Q6_K/Q8_0` critical tensors).
 - **`imatrix.dat`**: The importance matrix used for quantization.
 - **`calibration_data_v5_rc.txt`**: The calibration corpus used to generate the imatrix.
 
@@ -82,7 +83,7 @@ vllm serve sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32 \
 ```
 
 ### GGUF (llama.cpp)
-Optimized GGUF versions are available in this repository. We recommend using the `IQ4_K_M` variant for the best balance of size and performance.
+Optimized GGUF versions are available in this repository. We recommend using the `IQ4_K_M` variant for general use, and the `IQ3_S` multimodal-aware recipe when you specifically want more aggressive expert compression with selective precision overrides.
 
 ---
 
