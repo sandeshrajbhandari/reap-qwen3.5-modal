@@ -25,12 +25,21 @@ DEFAULT_DATASET_NAME = (
     "open-r1/Mixture-of-Thoughts[math]:250,"
     "open-r1/Mixture-of-Thoughts[science]:250"
 )
-DEFAULT_COMPRESSION_RATIO = 0.20
+DEFAULT_REQUESTED_COMPRESSION_RATIO = 0.80
+DEFAULT_MAX_EFFECTIVE_PARAMS_B = 24.0
 DEFAULT_MODEL_MAX_LENGTH = 4096
 DEFAULT_SEED = 42
 DEFAULT_RENORMALIZE_ROUTER_WEIGHTS = True
 PRUNE_METHOD = "reap"
 DEFAULT_HF_REPO_ID = "sandeshrajx/qwen3.5-122b-a10b-reap-0.20-composite"
+
+# Qwen/Qwen3.5-122B-A10B model-card math:
+# total = base + 256 * expert
+# active = base + 8 * expert
+TOTAL_PARAMS_B = 122.0
+ACTIVE_PARAMS_B = 10.0
+TOTAL_EXPERTS = 256
+ACTIVE_EXPERTS = 8
 
 VISUAL_TENSOR_PREFIX = "model.visual."
 MULTIMODAL_METADATA_FILES = [
@@ -172,6 +181,39 @@ def patch_reap_lazy_eval_import():
 
     if patched_files:
         print(f"Patched lazy eval import in: {', '.join(patched_files)}")
+
+
+def _derive_param_budget():
+    expert_params_b = (TOTAL_PARAMS_B - ACTIVE_PARAMS_B) / (TOTAL_EXPERTS - ACTIVE_EXPERTS)
+    base_params_b = ACTIVE_PARAMS_B - ACTIVE_EXPERTS * expert_params_b
+    expert_pool_params_b = TOTAL_EXPERTS * expert_params_b
+    return base_params_b, expert_params_b, expert_pool_params_b
+
+
+def resolve_compression_ratio(requested_ratio: float, max_effective_params_b: float) -> tuple[float, dict]:
+    base_params_b, expert_params_b, expert_pool_params_b = _derive_param_budget()
+    if max_effective_params_b <= base_params_b:
+        raise ValueError(
+            f"Target effective params ({max_effective_params_b:.2f}B) is below the dense base "
+            f"floor ({base_params_b:.2f}B)."
+        )
+
+    required_ratio = 1.0 - ((max_effective_params_b - base_params_b) / expert_pool_params_b)
+    required_ratio = min(max(required_ratio, 0.0), 1.0)
+    effective_ratio = max(requested_ratio, required_ratio)
+    retained_experts = TOTAL_EXPERTS - int(TOTAL_EXPERTS * effective_ratio)
+    effective_params_b = base_params_b + expert_pool_params_b * (1.0 - effective_ratio)
+
+    return effective_ratio, {
+        "requested_ratio": requested_ratio,
+        "required_ratio_for_target": required_ratio,
+        "effective_ratio": effective_ratio,
+        "estimated_base_params_b": base_params_b,
+        "estimated_expert_params_b": expert_params_b,
+        "estimated_expert_pool_params_b": expert_pool_params_b,
+        "estimated_effective_params_b": effective_params_b,
+        "estimated_retained_experts_per_layer": retained_experts,
+    }
 
 
 def _copy_if_exists(src: pathlib.Path, dst: pathlib.Path):
@@ -524,7 +566,8 @@ def run_observer(dataset_name: str, model_max_length: int, seed: int):
     timeout=240 * MINUTES,
 )
 def run_pruning(
-    compression_ratio: float,
+    requested_compression_ratio: float,
+    max_effective_params_b: float,
     dataset_name: str,
     model_max_length: int,
     seed: int,
@@ -533,6 +576,11 @@ def run_pruning(
     import subprocess
 
     sync_and_show_commit()
+    effective_ratio, budget = resolve_compression_ratio(
+        requested_compression_ratio, max_effective_params_b
+    )
+    print("Requested prune plan:")
+    print(json.dumps(budget, indent=2))
 
     if not os.path.exists("artifacts"):
         os.symlink("/results", "artifacts")
@@ -546,7 +594,7 @@ def run_pruning(
         "--dataset_name",
         dataset_name,
         "--compression_ratio",
-        str(compression_ratio),
+        str(effective_ratio),
         "--prune_method",
         PRUNE_METHOD,
         "--do_eval",
@@ -592,18 +640,27 @@ def upload_to_hf(repo_id: str):
 @app.local_entrypoint()
 def main(
     hf_repo_id: str = DEFAULT_HF_REPO_ID,
-    compression_ratio: float = DEFAULT_COMPRESSION_RATIO,
+    requested_compression_ratio: float = DEFAULT_REQUESTED_COMPRESSION_RATIO,
+    max_effective_params_b: float = DEFAULT_MAX_EFFECTIVE_PARAMS_B,
     dataset_name: str = DEFAULT_DATASET_NAME,
     model_max_length: int = DEFAULT_MODEL_MAX_LENGTH,
     seed: int = DEFAULT_SEED,
     renormalize_router_weights: bool = DEFAULT_RENORMALIZE_ROUTER_WEIGHTS,
     prune_only: bool = False,
 ):
+    effective_ratio, budget = resolve_compression_ratio(
+        requested_compression_ratio, max_effective_params_b
+    )
     print(
-        "Prune configuration:\n"
+        "Planned pruning summary:\n"
         f" model={MODEL_NAME}\n"
         f" dataset_name={dataset_name}\n"
-        f" compression_ratio={compression_ratio}\n"
+        f" requested_ratio={budget['requested_ratio']:.4f}\n"
+        f" required_ratio_for_target={budget['required_ratio_for_target']:.4f}\n"
+        f" effective_ratio_used={effective_ratio:.4f}\n"
+        f" estimated_effective_params_b={budget['estimated_effective_params_b']:.2f}\n"
+        f" estimated_retained_experts_per_layer={budget['estimated_retained_experts_per_layer']}\n"
+        f" max_effective_params_b={max_effective_params_b:.2f}\n"
         f" prune_method={PRUNE_METHOD}\n"
         f" seed={seed}\n"
         f" model_max_length={model_max_length}\n"
@@ -615,7 +672,8 @@ def main(
         run_observer.remote(dataset_name, model_max_length, seed)
 
     run_pruning.remote(
-        compression_ratio,
+        requested_compression_ratio,
+        max_effective_params_b,
         dataset_name,
         model_max_length,
         seed,
