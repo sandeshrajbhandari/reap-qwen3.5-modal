@@ -3,3 +3,7 @@ __pycache__/
 temp_reap/
 .modal/
 .env
+
+# RestoreLCC runtime artifacts (generated on Modal or locally)
+restorelcc/processed_data/
+restorelcc/processed_data2/
