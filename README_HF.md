@@ -85,6 +85,15 @@ vllm serve sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32 \
 ### GGUF (llama.cpp)
 Optimized GGUF versions are available in this repository. We recommend using the `IQ4_K_M` variant for general use, and the `IQ3_S` multimodal-aware recipe when you specifically want more aggressive expert compression with selective precision overrides.
 
+For multimodal runs, publish the pair:
+- text model GGUF (e.g. `...-IQ3_S.gguf`)
+- matching projector GGUF (e.g. `...-mmproj-f16.gguf`)
+
+In llama.cpp tools, load both files:
+```bash
+llama-server -m /path/to/model-IQ3_S.gguf --mmproj /path/to/model-mmproj-f16.gguf
+```
+
 ---
 
 ## 🧩 Model Creation
