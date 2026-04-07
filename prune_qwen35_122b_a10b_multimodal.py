@@ -119,6 +119,10 @@ image = (
 )
 
 MINUTES = 60
+OBSERVER_GPU = "A100-80GB:4"
+PRUNING_GPU = "A100-80GB:4"
+OBSERVER_TIMEOUT_MINUTES = 360
+PRUNING_TIMEOUT_MINUTES = 480
 
 
 def _as_cli_bool(value: bool) -> str:
@@ -524,10 +528,10 @@ def download_model():
 
 @app.function(
     image=image,
-    gpu="A100-80GB",
+    gpu=OBSERVER_GPU,
     volumes={HF_CACHE_DIR: hf_cache_vol, RESULTS_DIR: results_vol},
     secrets=[huggingface_secret],
-    timeout=120 * MINUTES,
+    timeout=OBSERVER_TIMEOUT_MINUTES * MINUTES,
 )
 def run_observer(dataset_name: str, model_max_length: int, seed: int):
     import subprocess
@@ -560,10 +564,10 @@ def run_observer(dataset_name: str, model_max_length: int, seed: int):
 
 @app.function(
     image=image,
-    gpu="A100-80GB",
+    gpu=PRUNING_GPU,
     volumes={HF_CACHE_DIR: hf_cache_vol, RESULTS_DIR: results_vol},
     secrets=[huggingface_secret],
-    timeout=240 * MINUTES,
+    timeout=PRUNING_TIMEOUT_MINUTES * MINUTES,
 )
 def run_pruning(
     requested_compression_ratio: float,
