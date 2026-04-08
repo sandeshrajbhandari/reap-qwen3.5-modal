@@ -8,7 +8,15 @@ app = modal.App("iq3-s-multimodal-quantizer")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12")
-    .pip_install("huggingface-hub")
+    .pip_install(
+        "huggingface-hub",
+        "torch",
+        "transformers",
+        "sentencepiece",
+        "protobuf",
+        "numpy",
+        "gguf",
+    )
 )
 
 results_vol = modal.Volume.from_name("reap-results")
@@ -43,10 +51,7 @@ def run_iq3_s_quantization(
     from huggingface_hub import HfApi, snapshot_download
 
     model_path = os.path.join(RESULTS_DIR, model_subpath) if model_subpath else ""
-    if model_path and os.path.exists(model_path):
-        source_model_path = model_path
-        print(f"📁 Using model from volume path: {source_model_path}")
-    elif hf_source_repo:
+    if hf_source_repo:
         source_model_path = os.path.join(
             RESULTS_DIR,
             "hf-snapshots",
@@ -60,6 +65,9 @@ def run_iq3_s_quantization(
             ignore_patterns=["*.pt", "*.bin"],
         )
         print(f"✅ Model snapshot ready at: {source_model_path}")
+    elif model_path and os.path.exists(model_path):
+        source_model_path = model_path
+        print(f"📁 Using model from volume path: {source_model_path}")
     else:
         print(
             "❌ Could not resolve model path. Provide either:\n"
