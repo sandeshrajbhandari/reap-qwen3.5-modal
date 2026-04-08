@@ -44,18 +44,6 @@ def _load_ops():
         _decode_w4 = torch.ops.qwen35_megakernel_bf16_C.decode_w4
 
 
-def _extract_language_state_dict(model):
-    """Handle Qwen3.5-VL (model.language_model.*) and causal (model.*) checkpoints."""
-    raw = model.state_dict()
-    lm_prefix = "model.language_model."
-    if any(k.startswith(lm_prefix) for k in raw):
-        return {k[len(lm_prefix) :]: v for k, v in raw.items() if k.startswith(lm_prefix)}
-    m_prefix = "model."
-    if any(k.startswith(m_prefix) for k in raw):
-        return {k[len(m_prefix) :]: v for k, v in raw.items() if k.startswith(m_prefix)}
-    return raw
-
-
 def load_weights(model_name="Qwen/Qwen3.5-9B", verbose=True):
     """Load Qwen3.5-9B text weights as bf16 (no quantization)."""
     if not verbose:
@@ -63,11 +51,12 @@ def load_weights(model_name="Qwen/Qwen3.5-9B", verbose=True):
         os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
         os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
-    from transformers import AutoConfig, AutoModel
+    from transformers import AutoConfig, AutoTokenizer
+    from hf_weights import merge_safetensors_shards, strip_to_language_state
 
     if verbose:
         print(f"Loading {model_name} (bf16)...")
-    cfg = AutoConfig.from_pretrained(model_name)
+    cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     text_cfg = getattr(cfg, "text_config", cfg)
     lt_cfg = text_cfg.layer_types
     lt = [0 if x == "linear_attention" else 1 for x in lt_cfg]
@@ -77,14 +66,20 @@ def load_weights(model_name="Qwen/Qwen3.5-9B", verbose=True):
             "update kernel.cu / model.py if the checkpoint pattern changed."
         )
 
-    model = AutoModel.from_pretrained(
-        model_name, dtype=torch.bfloat16, device_map="cuda", trust_remote_code=True
-    )
-    from transformers import AutoTokenizer
-
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    raw_state = model.state_dict()
-    state = _extract_language_state_dict(model)
+    # Load weights from disk (CPU) — avoids loading full Qwen3.5-VL into 22GB VRAM before stripping keys.
+    merged = merge_safetensors_shards(model_name)
+    raw_state = merged
+    state_cpu = strip_to_language_state(merged)
+    if "layers.0.input_layernorm.weight" not in state_cpu:
+        raise KeyError(
+            "Could not find layers.* in merged checkpoint; expected model.layers.* or model.language_model.layers.*"
+        )
+
+    def _get(k):
+        if k not in state_cpu:
+            raise KeyError(k)
+        return state_cpu[k].to(device="cuda", dtype=torch.bfloat16).contiguous()
 
     layer_data = []
     for i in range(NUM_LAYERS):
@@ -95,47 +90,43 @@ def load_weights(model_name="Qwen/Qwen3.5-9B", verbose=True):
             layer_data.append({
                 "type": 1,
                 "ptrs": [
-                    state[p + "input_layernorm.weight"].contiguous(),
-                    state[p + "self_attn.q_proj.weight"].contiguous(),
-                    state[p + "self_attn.k_proj.weight"].contiguous(),
-                    state[p + "self_attn.v_proj.weight"].contiguous(),
-                    state[p + "self_attn.q_norm.weight"].contiguous(),
-                    state[p + "self_attn.k_norm.weight"].contiguous(),
-                    state[p + "self_attn.o_proj.weight"].contiguous(),
-                    state[p + "post_attention_layernorm.weight"].contiguous(),
-                    state[p + "mlp.gate_proj.weight"].contiguous(),
-                    state[p + "mlp.up_proj.weight"].contiguous(),
-                    state[p + "mlp.down_proj.weight"].contiguous(),
+                    _get(p + "input_layernorm.weight"),
+                    _get(p + "self_attn.q_proj.weight"),
+                    _get(p + "self_attn.k_proj.weight"),
+                    _get(p + "self_attn.v_proj.weight"),
+                    _get(p + "self_attn.q_norm.weight"),
+                    _get(p + "self_attn.k_norm.weight"),
+                    _get(p + "self_attn.o_proj.weight"),
+                    _get(p + "post_attention_layernorm.weight"),
+                    _get(p + "mlp.gate_proj.weight"),
+                    _get(p + "mlp.up_proj.weight"),
+                    _get(p + "mlp.down_proj.weight"),
                 ]
             })
         else:
             layer_data.append({
                 "type": 0,
                 "ptrs": [
-                    state[p + "input_layernorm.weight"].contiguous(),
-                    state[p + "linear_attn.in_proj_qkv.weight"].contiguous(),
-                    state[p + "linear_attn.in_proj_z.weight"].contiguous(),
-                    state[p + "linear_attn.in_proj_b.weight"].contiguous(),
-                    state[p + "linear_attn.in_proj_a.weight"].contiguous(),
-                    state[p + "linear_attn.conv1d.weight"].contiguous(),
-                    state[p + "linear_attn.A_log"].contiguous(),
-                    state[p + "linear_attn.dt_bias"].contiguous(),
-                    state[p + "linear_attn.norm.weight"].contiguous(),
-                    state[p + "linear_attn.out_proj.weight"].contiguous(),
-                    state[p + "post_attention_layernorm.weight"].contiguous(),
-                    state[p + "mlp.gate_proj.weight"].contiguous(),
-                    state[p + "mlp.up_proj.weight"].contiguous(),
-                    state[p + "mlp.down_proj.weight"].contiguous(),
+                    _get(p + "input_layernorm.weight"),
+                    _get(p + "linear_attn.in_proj_qkv.weight"),
+                    _get(p + "linear_attn.in_proj_z.weight"),
+                    _get(p + "linear_attn.in_proj_b.weight"),
+                    _get(p + "linear_attn.in_proj_a.weight"),
+                    _get(p + "linear_attn.conv1d.weight"),
+                    _get(p + "linear_attn.A_log"),
+                    _get(p + "linear_attn.dt_bias"),
+                    _get(p + "linear_attn.norm.weight"),
+                    _get(p + "linear_attn.out_proj.weight"),
+                    _get(p + "post_attention_layernorm.weight"),
+                    _get(p + "mlp.gate_proj.weight"),
+                    _get(p + "mlp.up_proj.weight"),
+                    _get(p + "mlp.down_proj.weight"),
                 ]
             })
 
-    embed_weight = state["embed_tokens.weight"].contiguous()
-    final_norm_weight = state["norm.weight"].contiguous()
-    lm = raw_state.get("lm_head.weight")
-    if lm is None:
-        lm = embed_weight
-    else:
-        lm = lm.contiguous()
+    embed_weight = _get("embed_tokens.weight")
+    final_norm_weight = _get("norm.weight")
+    lm = _get("lm_head.weight") if "lm_head.weight" in raw_state else embed_weight
 
     weights = {
         "embed_weight": embed_weight,

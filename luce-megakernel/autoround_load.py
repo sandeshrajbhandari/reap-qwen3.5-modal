@@ -8,7 +8,15 @@ import torch
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 
-from model import HIDDEN_SIZE, INTERMEDIATE_SIZE, LAYER_TYPE, NUM_LAYERS, VOCAB_SIZE
+from model import (
+    DN_CONV_CHANNELS,
+    FA_QPROJ_SIZE,
+    HIDDEN_SIZE,
+    INTERMEDIATE_SIZE,
+    LAYER_TYPE,
+    NUM_LAYERS,
+    VOCAB_SIZE,
+)
 
 
 def _merge_shards(model_name: str) -> Dict[str, torch.Tensor]:
