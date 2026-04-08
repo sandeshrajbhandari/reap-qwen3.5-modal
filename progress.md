@@ -42,3 +42,17 @@ The goal of this project was to implement and execute the REAP (Resource-Efficie
 ## Final Status
 - **Pruned Model**: Successfully uploaded sharded Safetensors to [sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32](https://huggingface.co/sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32).
 - **GGUF Master Repo**: Consolidated F16, imatrix, and IQ quants at [sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32-GGUF](https://huggingface.co/sandeshrajx/Qwen3.5-24B-A3B-REAP-0.32-GGUF).
+
+## Session Update (2026-04-06)
+- Re-validated pruning CLI compatibility for Qwen3.5 MoE workflows against the fork and upstream REAP changes.
+- Confirmed that the pruning entrypoint remains `reap.prune` / `src/reap/prune.py` (not `reap.layerwise_prune`).
+- Verified upstream commit `2b114e7` ("Support composite calibration dataset") adds support for composite dataset specs such as:
+  - `dataset_a:250,dataset_b[subset]:250,dataset_c(split):250`
+- Verified `--renormalize_router_weights true` remains supported in the same path.
+- Dry-ran the upstream sync procedure for branch `feat/qwen3.5-moe-support`, including conflict points in:
+  - `README.md`
+  - `src/reap/observer.py`
+- Confirmed merged behavior should preserve both:
+  - Qwen3.5 fused/gate observer compatibility
+  - composite dataset parsing/loading pipeline
+- Session handoff completed with exact sync commands documented to run in the fork where push permissions are available.
