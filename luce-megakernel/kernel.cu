@@ -4,10 +4,11 @@
  * DeltaNet state: f32 (recurrence needs precision).
  *
  * Optimized for: NVIDIA RTX 3090 (sm_86, 82 SMs)
- * Model:         Qwen/Qwen3.5-9B (bf16 weights)
+ * Model:         Qwen/Qwen3.5-9B (bf16 or AutoRound auto_gptq int4 weights)
  */
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 // =============================================================================
@@ -46,6 +47,10 @@ constexpr int DN_CONV_CHANNELS = DN_QK_SIZE + DN_QK_SIZE + DN_V_SIZE;
 constexpr int DN_QK_BROADCAST_FLOATS = DN_NUM_K_HEADS * 2 * DN_KEY_DIM;
 
 constexpr int MAX_ACT_DIM = (HIDDEN_SIZE > INTERMEDIATE_SIZE) ? HIDDEN_SIZE : INTERMEDIATE_SIZE;
+
+// AutoRound / GPTQ int4 (symmetric): packing matches auto_round.utils.missing_tensors.quantize_weight_rtn
+constexpr int Q4_GROUP_SIZE = 128;
+constexpr int Q4_PACK_IN = 8;   // 32 bits / 4 bits
 
 #ifndef NUM_BLOCKS
 #define NUM_BLOCKS 82
@@ -110,6 +115,47 @@ struct LayerWeights {
         FullAttnWeights fa;
     };
 };
+
+// ---- AutoRound auto_gptq int4 (symmetric shifted; see auto_round quantize_weight_rtn) ----
+#pragma pack(push, 8)
+struct Q4Linear {
+    const int *__restrict__ qweight;   // [in_dim/8, out_dim] row-major int32
+    const __half *__restrict__ scales;   // [in_dim/128, out_dim] fp16
+    const int *__restrict__ qzeros;      // [in_dim/128, out_dim/8] packed nibbles
+};
+
+struct FullAttnWeightsW4 {
+    const __nv_bfloat16 *input_layernorm_weight;
+    Q4Linear q_proj, k_proj, v_proj;
+    const __nv_bfloat16 *q_norm_weight;
+    const __nv_bfloat16 *k_norm_weight;
+    Q4Linear o_proj;
+    const __nv_bfloat16 *post_attn_layernorm_weight;
+    Q4Linear gate_proj, up_proj, down_proj;
+    char _fa_pad[40];
+};
+
+struct DeltaNetWeightsW4 {
+    const __nv_bfloat16 *input_layernorm_weight;
+    Q4Linear qkv_proj, z_proj, beta_proj, alpha_proj;
+    const __nv_bfloat16 *conv1d_weight;
+    const __nv_bfloat16 *a_log;
+    const __nv_bfloat16 *dt_bias;
+    const __nv_bfloat16 *norm_weight;
+    Q4Linear out_proj;
+    const __nv_bfloat16 *post_attn_layernorm_weight;
+    Q4Linear gate_proj, up_proj, down_proj;
+};
+
+struct LayerWeightsW4 {
+    int layer_type;
+    int _pad[3];
+    union {
+        DeltaNetWeightsW4 dn;
+        FullAttnWeightsW4 fa;
+    };
+};
+#pragma pack(pop)
 
 // =============================================================================
 // Atomic barrier
@@ -415,6 +461,153 @@ __device__ void matvec_o_residual_bf16(
 }
 
 // =============================================================================
+// AutoRound int4 (auto_gptq pack) — symmetric shifted quint, per-group scale/zero nibble
+// =============================================================================
+
+__device__ __forceinline__ float w4_weight_at(
+    const int *__restrict__ qweight, int in_dim, int out_dim,
+    const __half *__restrict__ scales, const int *__restrict__ qzeros,
+    int m, int k_col)
+{
+    int in_p = k_col / Q4_PACK_IN;
+    int sub = k_col % Q4_PACK_IN;
+    int packed = __ldg(qweight + (size_t)in_p * out_dim + m);
+    int quint = (packed >> (4 * sub)) & 0xF;
+    int g = k_col / Q4_GROUP_SIZE;
+    int zp_word = __ldg(qzeros + (size_t)g * (out_dim / Q4_PACK_IN) + (m / Q4_PACK_IN));
+    int zp_nib = (zp_word >> (4 * (m % Q4_PACK_IN))) & 0xF;
+    float sc = __half2float(__ldg(scales + (size_t)g * out_dim + m));
+    return ((float)quint - (float)zp_nib) * sc;
+}
+
+__device__ void matvec_w4_bf16_act(
+    const __nv_bfloat16 *__restrict__ s_input,
+    const Q4Linear &W,
+    float *__restrict__ output,
+    int in_dim, int out_dim, int num_blocks)
+{
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    int rows_per_block = (out_dim + num_blocks - 1) / num_blocks;
+    int row_start = block_id * rows_per_block;
+    int row_end = min(row_start + rows_per_block, out_dim);
+
+    for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
+        int m = m_base + warp_id;
+        if (m < row_end) {
+            float sum = 0.0f;
+            for (int k = lane_id * Q4_PACK_IN; k < in_dim; k += WARP_SIZE * Q4_PACK_IN) {
+#pragma unroll
+                for (int i = 0; i < Q4_PACK_IN; i++) {
+                    float a = __bfloat162float(s_input[k + i]);
+                    sum += a * w4_weight_at(W.qweight, in_dim, out_dim, W.scales, W.qzeros, m, k + i);
+                }
+            }
+            sum = warp_reduce_sum(sum);
+            if (lane_id == 0) output[m] = sum;
+        }
+    }
+}
+
+__device__ void matvec_gate_up_silu_w4(
+    const __nv_bfloat16 *__restrict__ s_input,
+    const Q4Linear &gate, const Q4Linear &up,
+    float *__restrict__ output,
+    int in_dim, int out_dim, int num_blocks)
+{
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    int rows_per_block = (out_dim + num_blocks - 1) / num_blocks;
+    int row_start = block_id * rows_per_block;
+    int row_end = min(row_start + rows_per_block, out_dim);
+
+    for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
+        int m = m_base + warp_id;
+        if (m < row_end) {
+            float gate_sum = 0.0f, up_sum = 0.0f;
+            for (int k = lane_id * Q4_PACK_IN; k < in_dim; k += WARP_SIZE * Q4_PACK_IN) {
+#pragma unroll
+                for (int i = 0; i < Q4_PACK_IN; i++) {
+                    float a = __bfloat162float(s_input[k + i]);
+                    gate_sum += a * w4_weight_at(gate.qweight, in_dim, out_dim, gate.scales, gate.qzeros, m, k + i);
+                    up_sum += a * w4_weight_at(up.qweight, in_dim, out_dim, up.scales, up.qzeros, m, k + i);
+                }
+            }
+            gate_sum = warp_reduce_sum(gate_sum);
+            up_sum = warp_reduce_sum(up_sum);
+            if (lane_id == 0)
+                output[m] = fast_silu(gate_sum) * up_sum;
+        }
+    }
+}
+
+__device__ void matvec_down_residual_w4(
+    const float *__restrict__ s_input,
+    const Q4Linear &W,
+    const __nv_bfloat16 *__restrict__ residual,
+    __nv_bfloat16 *__restrict__ hidden_out,
+    int in_dim, int out_dim, int num_blocks)
+{
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    int rows_per_block = (out_dim + num_blocks - 1) / num_blocks;
+    int row_start = block_id * rows_per_block;
+    int row_end = min(row_start + rows_per_block, out_dim);
+
+    for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
+        int m = m_base + warp_id;
+        if (m < row_end) {
+            float sum = 0.0f;
+            for (int k = lane_id * Q4_PACK_IN; k < in_dim; k += WARP_SIZE * Q4_PACK_IN) {
+#pragma unroll
+                for (int i = 0; i < Q4_PACK_IN; i++)
+                    sum += s_input[k + i] * w4_weight_at(W.qweight, in_dim, out_dim, W.scales, W.qzeros, m, k + i);
+            }
+            sum = warp_reduce_sum(sum);
+            if (lane_id == 0)
+                hidden_out[m] = __float2bfloat16(sum + __bfloat162float(residual[m]));
+        }
+    }
+}
+
+__device__ void matvec_o_residual_w4(
+    const float *__restrict__ s_input,
+    const Q4Linear &W,
+    const __nv_bfloat16 *__restrict__ residual,
+    __nv_bfloat16 *__restrict__ hidden_out,
+    int in_dim, int out_dim, int num_blocks)
+{
+    int block_id = blockIdx.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    int rows_per_block = (out_dim + num_blocks - 1) / num_blocks;
+    int row_start = block_id * rows_per_block;
+    int row_end = min(row_start + rows_per_block, out_dim);
+
+    for (int m_base = row_start; m_base < row_end; m_base += NUM_WARPS) {
+        int m = m_base + warp_id;
+        if (m < row_end) {
+            float sum = 0.0f;
+            for (int k = lane_id * Q4_PACK_IN; k < in_dim; k += WARP_SIZE * Q4_PACK_IN) {
+#pragma unroll
+                for (int i = 0; i < Q4_PACK_IN; i++)
+                    sum += s_input[k + i] * w4_weight_at(W.qweight, in_dim, out_dim, W.scales, W.qzeros, m, k + i);
+            }
+            sum = warp_reduce_sum(sum);
+            if (lane_id == 0)
+                hidden_out[m] = __float2bfloat16(sum + __bfloat162float(residual[m]));
+        }
+    }
+}
+
+// =============================================================================
 // Full Attention layer (bf16)
 // =============================================================================
 
@@ -580,6 +773,162 @@ __device__ void full_attention_layer(
 
     matvec_down_residual_bf16(s_mlp, w.down_proj_weight, g_residual, hidden_out,
                                INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+    grid.sync();
+}
+
+__device__ void full_attention_layer_w4(
+    AtomicGridSync &grid,
+    const FullAttnWeightsW4 &w,
+    const __nv_bfloat16 *__restrict__ input,
+    __nv_bfloat16 *__restrict__ k_cache,
+    __nv_bfloat16 *__restrict__ v_cache,
+    __nv_bfloat16 *__restrict__ g_residual,
+    float *__restrict__ g_activations,
+    float *__restrict__ g_q,
+    float *__restrict__ g_kv,
+    float *__restrict__ g_attn_out,
+    float *__restrict__ g_mlp_inter,
+    __nv_bfloat16 *__restrict__ hidden_out,
+    int position, int max_seq_len,
+    __nv_bfloat16 *__restrict__ shmem)
+{
+    int block_id = blockIdx.x;
+    int num_blocks = gridDim.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    __nv_bfloat16 *s_norm = shmem;
+    rmsnorm_redundant(input, w.input_layernorm_weight, s_norm, g_residual);
+
+    matvec_w4_bf16_act(s_norm, w.q_proj, g_q, HIDDEN_SIZE, FA_QPROJ_SIZE, num_blocks);
+    matvec_w4_bf16_act(s_norm, w.k_proj, g_kv, HIDDEN_SIZE, FA_KV_SIZE, num_blocks);
+    matvec_w4_bf16_act(s_norm, w.v_proj, g_kv + FA_KV_SIZE, HIDDEN_SIZE, FA_KV_SIZE, num_blocks);
+    grid.sync();
+
+    if (block_id == 0) {
+        float *k_buf = g_kv, *v_buf = g_kv + FA_KV_SIZE;
+        for (int h = warp_id; h < FA_NUM_KV_HEADS; h += NUM_WARPS) {
+            float *kh = k_buf + h * FA_HEAD_DIM, *vh = v_buf + h * FA_HEAD_DIM;
+            __nv_bfloat16 *kc = k_cache + h * max_seq_len * FA_HEAD_DIM + position * FA_HEAD_DIM;
+            __nv_bfloat16 *vc = v_cache + h * max_seq_len * FA_HEAD_DIM + position * FA_HEAD_DIM;
+            float ss = 0; for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) ss += kh[i]*kh[i];
+            ss = warp_reduce_sum(ss); float sc = rsqrtf(ss / float(FA_HEAD_DIM) + RMS_EPS);
+            sc = __shfl_sync(0xffffffff, sc, 0);
+            for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
+                float normed = kh[i] * sc * (1.0f + __bfloat162float(__ldg(w.k_norm_weight + i)));
+                if (i < FA_ROTARY_DIM) {
+                    float fe = float(2*(i%(FA_ROTARY_DIM/2))) / float(FA_ROTARY_DIM);
+                    float freq = float(position) / powf(FA_ROPE_THETA, fe);
+                    float cv = cosf(freq), sv = sinf(freq);
+                    int p = (i < FA_ROTARY_DIM/2) ? i+FA_ROTARY_DIM/2 : i-FA_ROTARY_DIM/2;
+                    float pv = kh[p]*sc*(1.0f+__bfloat162float(__ldg(w.k_norm_weight+p)));
+                    float rotated = (i < FA_ROTARY_DIM/2) ? (normed*cv - pv*sv) : (pv*sv + normed*cv);
+                    kc[i] = __float2bfloat16(rotated);
+                } else { kc[i] = __float2bfloat16(normed); }
+                vc[i] = __float2bfloat16(vh[i]);
+            }
+        }
+    }
+    {
+        int hpb = (FA_NUM_Q_HEADS + num_blocks - 1) / num_blocks;
+        int hs = block_id * hpb, he = min(hs + hpb, FA_NUM_Q_HEADS);
+        for (int qh = hs; qh < he; qh++) {
+            float *qh_ptr = g_q + qh * FA_HEAD_DIM * 2;
+            if (warp_id == 0) {
+                float ss = 0; for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) ss += qh_ptr[i]*qh_ptr[i];
+                ss = warp_reduce_sum(ss); float sc = rsqrtf(ss / float(FA_HEAD_DIM) + RMS_EPS);
+                sc = __shfl_sync(0xffffffff, sc, 0);
+                for (int i = lane_id; i < FA_HEAD_DIM; i += WARP_SIZE) {
+                    float normed = qh_ptr[i]*sc*(1.0f+__bfloat162float(__ldg(w.q_norm_weight+i)));
+                    if (i < FA_ROTARY_DIM) {
+                        float fe = float(2*(i%(FA_ROTARY_DIM/2))) / float(FA_ROTARY_DIM);
+                        float freq = float(position) / powf(FA_ROPE_THETA, fe);
+                        float cv = cosf(freq), sv = sinf(freq);
+                        int p = (i < FA_ROTARY_DIM/2) ? i+FA_ROTARY_DIM/2 : i-FA_ROTARY_DIM/2;
+                        float pv = qh_ptr[p]*sc*(1.0f+__bfloat162float(__ldg(w.q_norm_weight+p)));
+                        qh_ptr[i] = (i < FA_ROTARY_DIM/2) ? (normed*cv-pv*sv) : (pv*sv+normed*cv);
+                    } else { qh_ptr[i] = normed; }
+                }
+            }
+        }
+    }
+    grid.sync();
+
+    {
+        int cache_len = position + 1;
+        float attn_scale = 1.0f / sqrtf(float(FA_HEAD_DIM));
+        int hpb = (FA_NUM_Q_HEADS + num_blocks - 1) / num_blocks;
+        int hs = block_id * hpb, he = min(hs + hpb, FA_NUM_Q_HEADS);
+        __shared__ float s_max_score[NUM_WARPS];
+        __shared__ float s_sum_exp[NUM_WARPS];
+        constexpr int EPL = FA_HEAD_DIM / WARP_SIZE;
+
+        for (int qh = hs; qh < he; qh++) {
+            int kvh = qh / FA_GQA_RATIO;
+            float *q_head = g_q + qh * FA_HEAD_DIM * 2;
+            float *out_head = g_attn_out + qh * FA_HEAD_DIM;
+            float max_score = -INFINITY, sum_exp = 0;
+            float out_acc[EPL], q_local[EPL];
+            for (int e = 0; e < EPL; e++) { out_acc[e] = 0; q_local[e] = q_head[lane_id*EPL+e]; }
+
+            for (int pos = warp_id; pos < cache_len; pos += NUM_WARPS) {
+                const __nv_bfloat16 *k_pos = k_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
+                const __nv_bfloat16 *v_pos = v_cache + kvh*max_seq_len*FA_HEAD_DIM + pos*FA_HEAD_DIM;
+                float score = 0;
+                for (int e = 0; e < EPL; e++) score += q_local[e] * __bfloat162float(__ldg(k_pos + lane_id*EPL+e));
+                score = warp_reduce_sum(score) * attn_scale;
+                score = __shfl_sync(0xffffffff, score, 0);
+                float old_max = max_score; max_score = fmaxf(max_score, score);
+                float exp_diff = fast_exp(old_max - max_score);
+                sum_exp = sum_exp * exp_diff + fast_exp(score - max_score);
+                float wt = fast_exp(score - max_score);
+                for (int e = 0; e < EPL; e++)
+                    out_acc[e] = out_acc[e]*exp_diff + wt*__bfloat162float(__ldg(v_pos + lane_id*EPL+e));
+            }
+            if (lane_id == 0) { s_max_score[warp_id] = max_score; s_sum_exp[warp_id] = sum_exp; }
+            for (int e = 0; e < EPL; e++) g_activations[warp_id*FA_HEAD_DIM + lane_id*EPL+e] = out_acc[e];
+            __syncthreads();
+
+            if (warp_id == 0) {
+                float gm = -INFINITY; for (int ww = 0; ww < NUM_WARPS; ww++) if (s_max_score[ww] > -INFINITY) gm = fmaxf(gm, s_max_score[ww]);
+                float ts = 0; float fo[EPL]; for (int e = 0; e < EPL; e++) fo[e] = 0;
+                for (int ww = 0; ww < NUM_WARPS; ww++) {
+                    if (s_max_score[ww] > -INFINITY) {
+                        float s = fast_exp(s_max_score[ww]-gm); ts += s_sum_exp[ww]*s;
+                        for (int e = 0; e < EPL; e++) fo[e] += g_activations[ww*FA_HEAD_DIM+lane_id*EPL+e]*s;
+                    }
+                }
+                float *gate_ptr = q_head + FA_HEAD_DIM;
+                float rcp = 1.0f / ts;
+                for (int e = 0; e < EPL; e++) {
+                    int idx = lane_id*EPL+e;
+                    out_head[idx] = fo[e]*rcp * fast_sigmoid(gate_ptr[idx]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+    grid.sync();
+
+    {
+        float *s_attn = reinterpret_cast<float *>(shmem);
+        for (int i = threadIdx.x; i < FA_Q_SIZE; i += BLOCK_SIZE) s_attn[i] = g_attn_out[i];
+        __syncthreads();
+        matvec_o_residual_w4(s_attn, w.o_proj, g_residual, hidden_out, FA_Q_SIZE, HIDDEN_SIZE, num_blocks);
+    }
+    grid.sync();
+
+    __nv_bfloat16 *s_act = shmem;
+    rmsnorm_from_bf16(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
+
+    matvec_gate_up_silu_w4(s_act, w.gate_proj, w.up_proj, g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+    grid.sync();
+
+    float *s_mlp = reinterpret_cast<float *>(shmem);
+    for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
+    __syncthreads();
+
+    matvec_down_residual_w4(s_mlp, w.down_proj, g_residual, hidden_out, INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
     grid.sync();
 }
 
@@ -775,6 +1124,187 @@ __device__ void deltanet_layer(
     grid.sync();
 }
 
+__device__ void deltanet_layer_w4(
+    AtomicGridSync &grid,
+    const DeltaNetWeightsW4 &w,
+    const __nv_bfloat16 *__restrict__ input,
+    __nv_bfloat16 *__restrict__ g_residual,
+    float *__restrict__ g_activations,
+    float *__restrict__ g_qkv,
+    float *__restrict__ g_z,
+    float *__restrict__ g_beta,
+    float *__restrict__ g_alpha,
+    float *__restrict__ g_dn_out,
+    float *__restrict__ g_mlp_inter,
+    float *__restrict__ dn_state,
+    float *__restrict__ conv_buf,
+    __nv_bfloat16 *__restrict__ hidden_out,
+    int dn_layer_idx,
+    __nv_bfloat16 *__restrict__ shmem)
+{
+    int block_id = blockIdx.x;
+    int num_blocks = gridDim.x;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    __nv_bfloat16 *s_norm = shmem;
+    rmsnorm_redundant(input, w.input_layernorm_weight, s_norm, g_residual);
+
+    matvec_w4_bf16_act(s_norm, w.qkv_proj, g_qkv, HIDDEN_SIZE, DN_CONV_CHANNELS, num_blocks);
+    matvec_w4_bf16_act(s_norm, w.z_proj, g_z, HIDDEN_SIZE, DN_V_SIZE, num_blocks);
+    matvec_w4_bf16_act(s_norm, w.beta_proj, g_beta, HIDDEN_SIZE, DN_NUM_V_HEADS, num_blocks);
+    matvec_w4_bf16_act(s_norm, w.alpha_proj, g_alpha, HIDDEN_SIZE, DN_NUM_V_HEADS, num_blocks);
+    grid.sync();
+
+    if (block_id < DN_NUM_K_HEADS) {
+        int k_head = block_id;
+        float *layer_conv = conv_buf + dn_layer_idx * DN_CONV_CHANNELS * DN_CONV_KERNEL;
+        __shared__ float s_q[DN_KEY_DIM], s_k[DN_KEY_DIM];
+
+        int head_ch_q = k_head * DN_KEY_DIM;
+        int head_ch_k = DN_QK_SIZE + k_head * DN_KEY_DIM;
+        for (int region = 0; region < 2; region++) {
+            int ch_base = (region == 0) ? head_ch_q : head_ch_k;
+            float *dst = (region == 0) ? s_q : s_k;
+            for (int c = threadIdx.x; c < DN_KEY_DIM; c += BLOCK_SIZE) {
+                int ch = ch_base + c;
+                float h0=layer_conv[ch*DN_CONV_KERNEL+1], h1=layer_conv[ch*DN_CONV_KERNEL+2], h2=layer_conv[ch*DN_CONV_KERNEL+3];
+                layer_conv[ch*DN_CONV_KERNEL]=h0; layer_conv[ch*DN_CONV_KERNEL+1]=h1;
+                layer_conv[ch*DN_CONV_KERNEL+2]=h2; layer_conv[ch*DN_CONV_KERNEL+3]=g_qkv[ch];
+                float co = 0;
+                for (int t = 0; t < DN_CONV_KERNEL; t++)
+                    co += layer_conv[ch*DN_CONV_KERNEL+t] * __bfloat162float(__ldg(w.conv1d_weight + ch*DN_CONV_KERNEL+t));
+                dst[c] = fast_silu(co);
+            }
+        }
+
+        constexpr float Q_SCALE = 1.0f / 11.313708498984761f;
+        if (warp_id == 0) {
+            float sq = 0; for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) sq += s_q[i]*s_q[i];
+            sq = warp_reduce_sum(sq); float n = rsqrtf(sq+1e-6f)*Q_SCALE;
+            n = __shfl_sync(0xffffffff,n,0); for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) s_q[i] *= n;
+        }
+        if (warp_id == 1) {
+            float sq = 0; for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) sq += s_k[i]*s_k[i];
+            sq = warp_reduce_sum(sq); float n = rsqrtf(sq+1e-6f);
+            n = __shfl_sync(0xffffffff,n,0); for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) s_k[i] *= n;
+        }
+        __syncthreads();
+
+        float *qk_bc = g_activations + k_head * (2 * DN_KEY_DIM);
+        for (int i = threadIdx.x; i < DN_KEY_DIM; i += BLOCK_SIZE) qk_bc[i] = s_q[i];
+        for (int i = threadIdx.x; i < DN_KEY_DIM; i += BLOCK_SIZE) qk_bc[DN_KEY_DIM + i] = s_k[i];
+    }
+    grid.sync();
+
+    if (block_id >= DN_NUM_K_HEADS && block_id < DN_NUM_K_HEADS + DN_NUM_V_HEADS) {
+        int v_head = block_id - DN_NUM_K_HEADS;
+        int k_head = v_head / DN_V_PER_K_HEAD;
+        float *layer_conv = conv_buf + dn_layer_idx * DN_CONV_CHANNELS * DN_CONV_KERNEL;
+        __shared__ float s_q[DN_KEY_DIM], s_k[DN_KEY_DIM], s_v[DN_VALUE_DIM];
+
+        const float *qk_bc = g_activations + k_head * (2 * DN_KEY_DIM);
+        for (int i = threadIdx.x; i < DN_KEY_DIM; i += BLOCK_SIZE) s_q[i] = qk_bc[i];
+        for (int i = threadIdx.x; i < DN_KEY_DIM; i += BLOCK_SIZE) s_k[i] = qk_bc[DN_KEY_DIM + i];
+        __syncthreads();
+
+        int ch_base = 2*DN_QK_SIZE + v_head * DN_VALUE_DIM;
+        for (int c = threadIdx.x; c < DN_VALUE_DIM; c += BLOCK_SIZE) {
+            int ch = ch_base + c;
+            float h0=layer_conv[ch*DN_CONV_KERNEL+1], h1=layer_conv[ch*DN_CONV_KERNEL+2], h2=layer_conv[ch*DN_CONV_KERNEL+3];
+            layer_conv[ch*DN_CONV_KERNEL]=h0; layer_conv[ch*DN_CONV_KERNEL+1]=h1;
+            layer_conv[ch*DN_CONV_KERNEL+2]=h2; layer_conv[ch*DN_CONV_KERNEL+3]=g_qkv[ch];
+            float co = 0;
+            for (int t = 0; t < DN_CONV_KERNEL; t++)
+                co += layer_conv[ch*DN_CONV_KERNEL+t] * __bfloat162float(__ldg(w.conv1d_weight + ch*DN_CONV_KERNEL+t));
+            s_v[c] = fast_silu(co);
+        }
+
+        if (threadIdx.x == 0) {
+            g_beta[v_head] = fast_sigmoid(g_beta[v_head]);
+            float a_log_val = __bfloat162float(__ldg(w.a_log + v_head));
+            float dt_b = __bfloat162float(__ldg(w.dt_bias + v_head));
+            float x = g_alpha[v_head] + dt_b;
+            float sp = (x > 20.0f) ? x : logf(1.0f + fast_exp(x));
+            g_alpha[v_head] = fast_exp(-fast_exp(a_log_val) * sp);
+        }
+        __syncthreads();
+
+        float decay = g_alpha[v_head], beta = g_beta[v_head];
+
+        __shared__ float s_kq;
+        if (warp_id == 0) {
+            float kq = 0; for (int i = lane_id; i < DN_KEY_DIM; i += WARP_SIZE) kq += s_k[i]*s_q[i];
+            kq = warp_reduce_sum(kq); if (lane_id == 0) s_kq = kq;
+        }
+        __syncthreads();
+        float kq = s_kq;
+
+        float *state = dn_state + v_head * DN_KEY_DIM * DN_VALUE_DIM;
+        float *out_head = g_dn_out + v_head * DN_VALUE_DIM;
+
+        constexpr int J_PER_WARP = DN_VALUE_DIM / NUM_WARPS;
+        constexpr int I_PER_LANE = DN_KEY_DIM / WARP_SIZE;
+
+#pragma unroll
+        for (int jj = 0; jj < J_PER_WARP; jj++) {
+            int j = warp_id * J_PER_WARP + jj;
+            float s_regs[I_PER_LANE], stk = 0, sqv = 0;
+#pragma unroll
+            for (int ii = 0; ii < I_PER_LANE; ii++) {
+                int i = lane_id + ii * WARP_SIZE;
+                float sv = state[j*DN_KEY_DIM+i]; s_regs[ii] = sv;
+                stk += sv * s_k[i]; sqv += sv * s_q[i];
+            }
+            stk = warp_reduce_sum(stk); sqv = warp_reduce_sum(sqv);
+            stk = __shfl_sync(0xffffffff,stk,0); sqv = __shfl_sync(0xffffffff,sqv,0);
+            float error_j = (s_v[j] - stk) * beta;
+            float o_j = decay * sqv + error_j * kq;
+            if (lane_id == 0) out_head[j] = o_j;
+#pragma unroll
+            for (int ii = 0; ii < I_PER_LANE; ii++) {
+                int i = lane_id + ii * WARP_SIZE;
+                state[j*DN_KEY_DIM+i] = s_regs[ii] * decay + s_k[i] * error_j;
+            }
+        }
+
+        __syncthreads();
+        {
+            __shared__ float smem_gnorm[NUM_WARPS];
+            float sq = 0; for (int i = threadIdx.x; i < DN_VALUE_DIM; i += BLOCK_SIZE) sq += out_head[i]*out_head[i];
+            sq = warp_reduce_sum(sq); if (lane_id == 0) smem_gnorm[warp_id] = sq; __syncthreads();
+            if (warp_id == 0) { float v = (lane_id < NUM_WARPS) ? smem_gnorm[lane_id] : 0; v = warp_reduce_sum(v); if (lane_id == 0) smem_gnorm[0] = rsqrtf(v/DN_VALUE_DIM + RMS_EPS); }
+            __syncthreads(); float rstd = smem_gnorm[0];
+            for (int i = threadIdx.x; i < DN_VALUE_DIM; i += BLOCK_SIZE) {
+                float normed = out_head[i] * rstd * __bfloat162float(__ldg(w.norm_weight + v_head * DN_VALUE_DIM + i));
+                float gate = fast_silu(g_z[v_head*DN_VALUE_DIM+i]);
+                out_head[i] = normed * gate;
+            }
+        }
+    }
+    grid.sync();
+
+    {
+        float *s_dn = reinterpret_cast<float *>(shmem);
+        for (int i = threadIdx.x; i < DN_V_SIZE; i += BLOCK_SIZE) s_dn[i] = g_dn_out[i];
+        __syncthreads();
+        matvec_o_residual_w4(s_dn, w.out_proj, g_residual, hidden_out, DN_V_SIZE, HIDDEN_SIZE, num_blocks);
+    }
+    grid.sync();
+
+    __nv_bfloat16 *s_act = shmem;
+    rmsnorm_from_bf16(hidden_out, w.post_attn_layernorm_weight, s_act, g_residual);
+
+    matvec_gate_up_silu_w4(s_act, w.gate_proj, w.up_proj, g_mlp_inter, HIDDEN_SIZE, INTERMEDIATE_SIZE, num_blocks);
+    grid.sync();
+
+    float *s_mlp = reinterpret_cast<float *>(shmem);
+    for (int i = threadIdx.x; i < INTERMEDIATE_SIZE; i += BLOCK_SIZE) s_mlp[i] = g_mlp_inter[i];
+    __syncthreads();
+    matvec_down_residual_w4(s_mlp, w.down_proj, g_residual, hidden_out, INTERMEDIATE_SIZE, HIDDEN_SIZE, num_blocks);
+    grid.sync();
+}
+
 // =============================================================================
 // LM Head: vocab projection + argmax
 // =============================================================================
@@ -938,6 +1468,97 @@ decode_kernel(
     }
 }
 
+__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+decode_kernel_w4(
+    const __nv_bfloat16 *__restrict__ embed_weight,
+    const __nv_bfloat16 *__restrict__ final_norm_weight,
+    const LayerWeightsW4 *__restrict__ layer_weights,
+    __nv_bfloat16 *__restrict__ fa_k_cache,
+    __nv_bfloat16 *__restrict__ fa_v_cache,
+    float *__restrict__ dn_states,
+    float *__restrict__ conv_bufs,
+    __nv_bfloat16 *__restrict__ hidden_buffer,
+    float *__restrict__ g_activations,
+    __nv_bfloat16 *__restrict__ g_residual,
+    float *__restrict__ g_qkv_scratch,
+    float *__restrict__ g_kv_scratch,
+    float *__restrict__ g_attn_out,
+    float *__restrict__ g_mlp_inter,
+    float *__restrict__ g_z_scratch,
+    float *__restrict__ g_beta_scratch,
+    float *__restrict__ g_alpha_scratch,
+    float *__restrict__ g_normalized,
+    unsigned int *__restrict__ barrier_counter,
+    unsigned int *__restrict__ barrier_generation,
+    int input_token_id, int position, int max_seq_len)
+{
+    int block_id = blockIdx.x;
+    int num_blocks = gridDim.x;
+
+    if (block_id == 0 && threadIdx.x == 0) { *barrier_counter = 0; *barrier_generation = 0; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        asm volatile("fence.acq_rel.gpu;" ::: "memory");
+        unsigned int arrived = atomicAdd(barrier_counter, 1);
+        if (arrived == (unsigned int)num_blocks - 1) { *barrier_counter = 0; asm volatile("fence.acq_rel.gpu;" ::: "memory"); atomicAdd(barrier_generation, 1); }
+        else { volatile unsigned int *vg = (volatile unsigned int *)barrier_generation; while (*vg == 0) {} }
+        asm volatile("fence.acq_rel.gpu;" ::: "memory");
+    }
+    __syncthreads();
+
+    AtomicGridSync grid{barrier_counter, barrier_generation, (unsigned int)num_blocks, 1};
+
+    __shared__ __align__(16) char shmem_raw[MAX_ACT_DIM * sizeof(float)];
+    __nv_bfloat16 *shmem_bf16 = reinterpret_cast<__nv_bfloat16 *>(shmem_raw);
+
+    const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+
+    int fa_kv_stride = FA_NUM_KV_HEADS * max_seq_len * FA_HEAD_DIM;
+    int dn_state_stride = DN_NUM_V_HEADS * DN_KEY_DIM * DN_VALUE_DIM;
+
+    int dn_layer_idx = 0, fa_layer_idx = 0;
+
+    for (int layer = 0; layer < NUM_LAYERS; layer++) {
+        const __nv_bfloat16 *layer_input = (layer == 0) ? embed_row : hidden_buffer;
+
+        if (LAYER_TYPE[layer] == 0) {
+            deltanet_layer_w4(
+                grid, layer_weights[layer].dn, layer_input,
+                g_residual, g_activations, g_qkv_scratch, g_z_scratch,
+                g_beta_scratch, g_alpha_scratch, g_attn_out, g_mlp_inter,
+                dn_states + dn_layer_idx * dn_state_stride,
+                conv_bufs, hidden_buffer, dn_layer_idx, shmem_bf16);
+            dn_layer_idx++;
+        } else {
+            full_attention_layer_w4(
+                grid, layer_weights[layer].fa, layer_input,
+                fa_k_cache + fa_layer_idx * fa_kv_stride,
+                fa_v_cache + fa_layer_idx * fa_kv_stride,
+                g_residual, g_activations, g_qkv_scratch, g_kv_scratch,
+                g_attn_out, g_mlp_inter, hidden_buffer,
+                position, max_seq_len, shmem_bf16);
+            fa_layer_idx++;
+        }
+    }
+
+    if (block_id == 0) {
+        __shared__ float smem_reduce[NUM_WARPS];
+        int warp_id = threadIdx.x / WARP_SIZE, lane_id = threadIdx.x % WARP_SIZE;
+        float local_sum_sq = 0;
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
+            float v = __bfloat162float(hidden_buffer[i]); g_activations[i] = v; local_sum_sq += v*v;
+        }
+        local_sum_sq = warp_reduce_sum(local_sum_sq);
+        if (lane_id == 0) smem_reduce[warp_id] = local_sum_sq; __syncthreads();
+        if (warp_id == 0) { float sum = (lane_id < NUM_WARPS) ? smem_reduce[lane_id] : 0; sum = warp_reduce_sum(sum); if (lane_id == 0) smem_reduce[0] = rsqrtf(sum/HIDDEN_SIZE + RMS_EPS); }
+        __syncthreads(); float rstd = smem_reduce[0];
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += BLOCK_SIZE) {
+            float wt = __bfloat162float(__ldg(final_norm_weight + i));
+            g_normalized[i] = g_activations[i] * rstd * (1.0f + wt);
+        }
+    }
+}
+
 // =============================================================================
 // C entry point
 // =============================================================================
@@ -962,6 +1583,46 @@ extern "C" void launch_decode(
         (const __nv_bfloat16 *)embed_weight,
         (const __nv_bfloat16 *)final_norm_weight,
         (const __nv_bfloat16 *)lm_head_weight,
+        layer_weights,
+        (__nv_bfloat16 *)fa_k_cache, (__nv_bfloat16 *)fa_v_cache,
+        (float *)dn_states, (float *)conv_bufs,
+        (__nv_bfloat16 *)hidden_buffer,
+        (float *)g_activations, (__nv_bfloat16 *)g_residual,
+        (float *)g_qkv_scratch, (float *)g_kv_scratch,
+        (float *)g_attn_out, (float *)g_mlp_inter,
+        (float *)g_z_scratch, (float *)g_beta_scratch,
+        (float *)g_alpha_scratch, (float *)g_normalized,
+        barrier_counter, barrier_generation,
+        input_token_id, position, max_seq_len);
+
+    cudaMemsetAsync(lm_sync_counter, 0, sizeof(unsigned int), stream);
+
+    lm_head_kernel<<<LM_NUM_BLOCKS, LM_BLOCK_SIZE, 0, stream>>>(
+        (const float *)g_normalized,
+        (const __nv_bfloat16 *)lm_head_weight,
+        block_max_vals, block_max_idxs,
+        output_token_id, lm_sync_counter);
+}
+
+extern "C" void launch_decode_w4(
+    int input_token_id, int *output_token_id,
+    const void *embed_weight, const LayerWeightsW4 *layer_weights,
+    const void *final_norm_weight,
+    const void *lm_head_weight,
+    void *fa_k_cache, void *fa_v_cache,
+    void *dn_states, void *conv_bufs,
+    void *hidden_buffer, void *g_activations, void *g_residual,
+    void *g_qkv_scratch, void *g_kv_scratch, void *g_attn_out,
+    void *g_mlp_inter, void *g_z_scratch, void *g_beta_scratch,
+    void *g_alpha_scratch, void *g_normalized,
+    unsigned int *barrier_counter, unsigned int *barrier_generation,
+    float *block_max_vals, int *block_max_idxs,
+    unsigned int *lm_sync_counter,
+    int position, int max_seq_len, cudaStream_t stream)
+{
+    decode_kernel_w4<<<NUM_BLOCKS, BLOCK_SIZE, 0, stream>>>(
+        (const __nv_bfloat16 *)embed_weight,
+        (const __nv_bfloat16 *)final_norm_weight,
         layer_weights,
         (__nv_bfloat16 *)fa_k_cache, (__nv_bfloat16 *)fa_v_cache,
         (float *)dn_states, (float *)conv_bufs,

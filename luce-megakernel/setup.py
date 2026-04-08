@@ -3,6 +3,8 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 setup(
     name="qwen35_megakernel_bf16",
+    install_requires=["torch"],
+    extras_require={"autoround": ["safetensors", "huggingface_hub", "transformers"]},
     ext_modules=[
         CUDAExtension(
             name="qwen35_megakernel_bf16_C",

@@ -3,16 +3,22 @@ Also tests end-to-end correctness (prefill → decode handoff).
 
 Scope: batch-size-1 single-stream decode, targeting local inference.
 All measurements use torch.cuda.synchronize() barriers + perf_counter.
-One warm-up run precedes each timed section."""
+One warm-up run precedes each timed section.
+
+Set USE_INTEL_AUTOROUND=1 to benchmark Intel/Qwen3.5-9B-int4-AutoRound (int4 layers + bf16 lm_head)."""
+import os
 import time, torch
 from model import Decoder, HIDDEN_SIZE, INTERMEDIATE_SIZE, FA_QPROJ_SIZE, FA_Q_SIZE, FA_KV_SIZE
 from model import DN_CONV_CHANNELS, DN_V_SIZE, DN_NUM_V_HEADS, MAX_SEQ_LEN
-import qwen35_megakernel_bf16_C
-from transformers import AutoTokenizer
 
-tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-9B", trust_remote_code=True)
-dec = Decoder(verbose=True)
-_pf = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
+USE_AR = os.environ.get("USE_INTEL_AUTOROUND", "").lower() in ("1", "true", "yes")
+if USE_AR:
+    dec = Decoder(verbose=True, weight_mode="autoround_int4")
+    tok = dec.tokenizer
+else:
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-9B", trust_remote_code=True)
+    dec = Decoder(verbose=True)
 
 # Allocate prefill buffers for max 512 tokens
 S_MAX = 512
@@ -39,19 +45,7 @@ bufs = dict(
 
 def prefill(ids):
     ids_t = torch.tensor(ids, dtype=torch.int32, device="cuda")
-    _pf(dec._out_token, ids_t,
-        dec._embed_weight, dec._layer_weights_packed,
-        dec._final_norm_weight, dec._lm_head_weight,
-        dec._fa_k_cache, dec._fa_v_cache, dec._dn_states, dec._conv_bufs,
-        bufs['hidden'], bufs['residual'], bufs['normalized'],
-        bufs['proj_buf'], bufs['proj_buf2'],
-        bufs['attn_buf'], bufs['mlp_buf'],
-        bufs['dn_out_buf'], bufs['beta_buf'], bufs['alpha_buf'],
-        bufs['final_normed'], bufs['hidden_bf16_out'],
-        bufs['lm_bmv'], bufs['lm_bmi'])
-    # Handoff: copy hidden state for decode kernel
-    dec._hidden.copy_(bufs['hidden_bf16_out'])
-    dec._position = len(ids)
+    dec.prefill(ids_t, bufs)
     return dec._out_token.item()
 
 # ============================================================
@@ -142,6 +136,7 @@ print(f"tg{len(gen_out)}: {tg_tps:.1f} tok/s ({tg_time*1000:.1f}ms)", flush=True
 # ============================================================
 # Summary
 # ============================================================
-print(f"\n=== Summary (RTX 3090, Qwen3.5-9B BF16) ===", flush=True)
+label = "Intel AutoRound int4" if USE_AR else "Qwen3.5-9B BF16"
+print(f"\n=== Summary (RTX 3090, {label}) ===", flush=True)
 print(f"pp{len(long_ids):>3d}: {pp_tps:>7.1f} tok/s", flush=True)
 print(f"tg{len(gen_out):>3d}: {tg_tps:>7.1f} tok/s", flush=True)

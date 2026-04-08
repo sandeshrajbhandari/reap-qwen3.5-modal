@@ -4,6 +4,7 @@
  */
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
@@ -38,6 +39,68 @@ constexpr int LAYER_TYPE[32] = {
 };
 
 struct PFLayerWeights { int layer_type; int _pad[3]; void *ptrs[14]; };
+
+constexpr int Q4_GS = 128;
+constexpr int Q4_PACK = 8;
+
+#pragma pack(push, 8)
+struct PFQ4 { void *qweight; void *scales; void *qzeros; };
+struct PFFD_W4 {
+    void *input_ln;
+    PFQ4 qkv, z, beta, alpha;
+    void *conv_w, *a_log, *dt_bias, *norm_w;
+    PFQ4 out_proj;
+    void *post_ln;
+    PFQ4 gate, up, down;
+};
+struct PFFA_W4 {
+    void *input_ln;
+    PFQ4 q_proj, k_proj, v_proj;
+    void *q_norm, *k_norm;
+    PFQ4 o_proj;
+    void *post_ln;
+    PFQ4 gate, up, down;
+    char _fa_pad[40];
+};
+struct PFLayerWeightsW4 {
+    int layer_type;
+    int _pad[3];
+    union { PFFD_W4 dn; PFFA_W4 fa; };
+};
+#pragma pack(pop)
+
+__device__ __forceinline__ float pf_w4_at(
+    const int *qw, int in_dim, int out_dim, const __half *sc, const int *qz, int m, int k)
+{
+    int in_p = k / Q4_PACK, sub = k % Q4_PACK;
+    int packed = __ldg(qw + (size_t)in_p * out_dim + m);
+    int quint = (packed >> (4 * sub)) & 0xF;
+    int g = k / Q4_GS;
+    int zp_word = __ldg(qz + (size_t)g * (out_dim / Q4_PACK) + (m / Q4_PACK));
+    int zp_nib = (zp_word >> (4 * (m % Q4_PACK))) & 0xF;
+    float s = __half2float(__ldg(sc + (size_t)g * out_dim + m));
+    return ((float)quint - (float)zp_nib) * s;
+}
+
+__global__ void pf_dequant_linear(
+    const int *qw, const __half *sc, const int *qz,
+    __nv_bfloat16 *out_rowmajor, int in_dim, int out_dim)
+{
+    int m = blockIdx.y;
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= out_dim || k >= in_dim) return;
+    float v = pf_w4_at(qw, in_dim, out_dim, sc, qz, m, k);
+    out_rowmajor[m * in_dim + k] = __float2bfloat16(v);
+}
+
+static void launch_dequant_linear(
+    const int *qw, const __half *sc, const int *qz,
+    __nv_bfloat16 *out, int in_dim, int out_dim, cudaStream_t stream)
+{
+    dim3 blk(256, 1, 1);
+    dim3 grd((in_dim + 255) / 256, out_dim, 1);
+    pf_dequant_linear<<<grd, blk, 0, stream>>>(qw, sc, qz, out, in_dim, out_dim);
+}
 
 __device__ __forceinline__ float pf_warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffff, v, o); return v;
@@ -322,6 +385,11 @@ __global__ void pf_lm_head(const __nv_bfloat16 *hidden, const __nv_bfloat16 *w,
         for(int o=16;o>0;o>>=1){float ov=__shfl_down_sync(0xffffffff,mv,o);int oi=__shfl_down_sync(0xffffffff,mi,o);if(ov>mv){mv=ov;mi=oi;}}
         if(lid==0){bmv[blockIdx.x]=mv;bmi[blockIdx.x]=mi;}}
 }
+__global__ void pf_bf16_to_float(const __nv_bfloat16 *src, float *dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __bfloat162float(src[i]);
+}
+
 __global__ void pf_lm_reduce(const float *bmv, const int *bmi, int *out, int nb) {
     int tid=threadIdx.x; float best=-1e30f; int bi=-1;
     for(int i=tid;i<nb;i+=blockDim.x){float v=bmv[i];if(v>best){best=v;bi=bmi[i];}}
@@ -363,9 +431,8 @@ extern "C" void launch_prefill_bf16(
     if (!cublas) cublasCreate(&cublas);
     cublasSetStream(cublas, stream);
 
-    static PFLayerWeights hl[NUM_LAYERS];
-    static bool copied = false;
-    if (!copied) { cudaMemcpy(hl, layers, NUM_LAYERS*sizeof(PFLayerWeights), cudaMemcpyDeviceToHost); copied = true; }
+    PFLayerWeights hl[NUM_LAYERS];
+    cudaMemcpy(hl, layers, NUM_LAYERS*sizeof(PFLayerWeights), cudaMemcpyDeviceToHost);
 
     int S = seq_len;
     int bk = (S*HIDDEN+255)/256;
@@ -462,6 +529,138 @@ extern "C" void launch_prefill_bf16(
             int mlp_bk = (S*INTER+255)/256;
             pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
             cublas_bf16_gemm(cublas, mlp_buf, down_w, proj_buf, S, HIDDEN, INTER);
+            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+
+            fa_idx++;
+        }
+    }
+
+    pf_final_norm<<<1, 512, 0, stream>>>(hidden, final_norm_w, final_normed, hidden_bf16_out, S);
+
+    int lm_blocks = 512;
+    pf_lm_head<<<lm_blocks, 256, 0, stream>>>(final_normed, lm_head_w, lm_bmv, lm_bmi, VOCAB);
+    pf_lm_reduce<<<1, 256, 0, stream>>>(lm_bmv, lm_bmi, output_token, lm_blocks);
+}
+
+// Scratch: bf16 row-major [out_dim, in_dim] for one linear (max ~50M elems for this model).
+extern "C" void launch_prefill_w4(
+    const int *token_ids, int seq_len, int *output_token,
+    const __nv_bfloat16 *embed_weight, const PFLayerWeightsW4 *layers,
+    const __nv_bfloat16 *final_norm_w, const __nv_bfloat16 *lm_head_w,
+    __nv_bfloat16 *fa_k_cache, __nv_bfloat16 *fa_v_cache,
+    float *dn_states, float *conv_bufs,
+    __nv_bfloat16 *hidden, __nv_bfloat16 *residual, __nv_bfloat16 *normalized,
+    __nv_bfloat16 *proj_buf, __nv_bfloat16 *proj_buf2,
+    __nv_bfloat16 *attn_buf, __nv_bfloat16 *mlp_buf,
+    __nv_bfloat16 *dn_out_buf,
+    float *beta_buf, float *alpha_buf,
+    __nv_bfloat16 *final_normed, __nv_bfloat16 *hidden_bf16_out,
+    float *lm_bmv, int *lm_bmi,
+    __nv_bfloat16 *w_dequant_scratch,
+    cudaStream_t stream)
+{
+    static cublasHandle_t cublas = nullptr;
+    if (!cublas) cublasCreate(&cublas);
+    cublasSetStream(cublas, stream);
+
+    PFLayerWeightsW4 hl[NUM_LAYERS];
+    cudaMemcpy(hl, layers, NUM_LAYERS * sizeof(PFLayerWeightsW4), cudaMemcpyDeviceToHost);
+
+    int S = seq_len;
+    int bk = (S*HIDDEN+255)/256;
+    pf_embed<<<bk, 256, 0, stream>>>(token_ids, embed_weight, hidden, S);
+
+    int fa_stride = FA_KV_HEADS * 2048 * FA_HEAD_DIM;
+    int dn_stride = DN_V_HEADS * DN_KEY * DN_VAL;
+    int fa_idx = 0, dn_idx = 0;
+
+    auto deq_gemm = [&](const PFQ4 &q, int in_dim, int out_dim,
+                        const __nv_bfloat16 *A, __nv_bfloat16 *C) {
+        launch_dequant_linear(
+            (const int *)q.qweight, (const __half *)q.scales, (const int *)q.qzeros,
+            w_dequant_scratch, in_dim, out_dim, stream);
+        cublas_bf16_gemm(cublas, A, w_dequant_scratch, C, S, out_dim, in_dim);
+    };
+
+    for (int li = 0; li < NUM_LAYERS; li++) {
+        const PFLayerWeightsW4 &lw = hl[li];
+        int lt = LAYER_TYPE[li];
+
+        if (lt == 0) {
+            const PFFD_W4 &d = lw.dn;
+            const __nv_bfloat16 *norm_w = (const __nv_bfloat16 *)d.input_ln;
+            pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, norm_w, normalized, residual, S, HIDDEN);
+
+            deq_gemm(d.qkv, HIDDEN, DN_CONV_CH, normalized, proj_buf);
+            deq_gemm(d.z, HIDDEN, DN_V_SIZE, normalized, proj_buf2);
+            launch_dequant_linear(
+                (const int *)d.beta.qweight, (const __half *)d.beta.scales, (const int *)d.beta.qzeros,
+                w_dequant_scratch, HIDDEN, DN_V_HEADS, stream);
+            cublas_bf16_gemm(cublas, normalized, w_dequant_scratch, attn_buf, S, DN_V_HEADS, HIDDEN);
+            pf_bf16_to_float<<<(S * DN_V_HEADS + 255) / 256, 256, 0, stream>>>(
+                attn_buf, beta_buf, S * DN_V_HEADS);
+            launch_dequant_linear(
+                (const int *)d.alpha.qweight, (const __half *)d.alpha.scales, (const int *)d.alpha.qzeros,
+                w_dequant_scratch, HIDDEN, DN_V_HEADS, stream);
+            cublas_bf16_gemm(cublas, normalized, w_dequant_scratch, attn_buf, S, DN_V_HEADS, HIDDEN);
+            pf_bf16_to_float<<<(S * DN_V_HEADS + 255) / 256, 256, 0, stream>>>(
+                attn_buf, alpha_buf, S * DN_V_HEADS);
+
+            const __nv_bfloat16 *conv_w = (const __nv_bfloat16 *)d.conv_w;
+            const __nv_bfloat16 *a_log = (const __nv_bfloat16 *)d.a_log;
+            const __nv_bfloat16 *dt_bias = (const __nv_bfloat16 *)d.dt_bias;
+            const __nv_bfloat16 *dn_norm = (const __nv_bfloat16 *)d.norm_w;
+
+            pf_deltanet_recurrence<<<DN_K_HEADS, 512, 0, stream>>>(
+                proj_buf, proj_buf2, beta_buf, alpha_buf,
+                conv_w, a_log, dt_bias, dn_norm,
+                dn_states + dn_idx * dn_stride,
+                conv_bufs + dn_idx * DN_CONV_CH * DN_CONV_K,
+                dn_out_buf, S);
+
+            deq_gemm(d.out_proj, DN_V_SIZE, HIDDEN, dn_out_buf, proj_buf);
+            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+
+            const __nv_bfloat16 *post_norm = (const __nv_bfloat16 *)d.post_ln;
+            pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
+            deq_gemm(d.gate, HIDDEN, INTER, normalized, proj_buf);
+            deq_gemm(d.up, HIDDEN, INTER, normalized, proj_buf2);
+            int mlp_bk = (S*INTER+255)/256;
+            pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
+            deq_gemm(d.down, INTER, HIDDEN, mlp_buf, proj_buf);
+            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+
+            dn_idx++;
+        } else {
+            const PFFA_W4 &fa = lw.fa;
+            const __nv_bfloat16 *norm_w = (const __nv_bfloat16 *)fa.input_ln;
+            pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, norm_w, normalized, residual, S, HIDDEN);
+
+            deq_gemm(fa.q_proj, HIDDEN, FA_QPROJ_SIZE, normalized, proj_buf);
+            deq_gemm(fa.k_proj, HIDDEN, FA_KV_SIZE, normalized, proj_buf2);
+            deq_gemm(fa.v_proj, HIDDEN, FA_KV_SIZE, normalized, attn_buf);
+
+            const __nv_bfloat16 *q_nw = (const __nv_bfloat16 *)fa.q_norm;
+            const __nv_bfloat16 *k_nw = (const __nv_bfloat16 *)fa.k_norm;
+
+            int total_heads = S*(FA_Q_HEADS+FA_KV_HEADS);
+            pf_qk_norm_rope<<<(total_heads+15)/16, 512, 0, stream>>>(
+                proj_buf, proj_buf2, attn_buf, q_nw, k_nw,
+                fa_k_cache + fa_idx*fa_stride, fa_v_cache + fa_idx*fa_stride, S, 2048);
+
+            pf_causal_attn<<<(S*FA_Q_HEADS+15)/16, 512, 0, stream>>>(
+                proj_buf, proj_buf2, attn_buf, dn_out_buf, S);
+
+            deq_gemm(fa.o_proj, FA_Q_SIZE, HIDDEN, dn_out_buf, proj_buf);
+            pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
+
+            const __nv_bfloat16 *post_norm = (const __nv_bfloat16 *)fa.post_ln;
+            pf_rmsnorm<<<S, 512, 0, stream>>>(hidden, post_norm, normalized, residual, S, HIDDEN);
+            deq_gemm(fa.gate, HIDDEN, INTER, normalized, proj_buf);
+            deq_gemm(fa.up, HIDDEN, INTER, normalized, proj_buf2);
+            int mlp_bk = (S*INTER+255)/256;
+            pf_silu_mul_bf16<<<mlp_bk, 256, 0, stream>>>(proj_buf, proj_buf2, mlp_buf, S*INTER);
+            deq_gemm(fa.down, INTER, HIDDEN, mlp_buf, proj_buf);
             pf_add_residual_bf16<<<bk, 256, 0, stream>>>(proj_buf, residual, hidden, S*HIDDEN);
 
             fa_idx++;

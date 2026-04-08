@@ -113,11 +113,20 @@ pip install -e .
 python bench_pp_tg.py    # runs pp520 tg128, prints tok/s and tok/J
 ```
 
+**Intel AutoRound int4 (`Intel/Qwen3.5-9B-int4-AutoRound`):** layers use `auto_round:auto_gptq` packing (group size 128, symmetric). Decode runs int4 matvec in the megakernel; prefill dequantizes each linear to bf16 in a scratch buffer then uses cuBLAS (needs **~400 MB** extra VRAM for the largest dequant tile; **~2 GB** lm_head stays bf16).
+
+```bash
+pip install safetensors huggingface_hub
+USE_INTEL_AUTOROUND=1 python bench_pp_tg.py
+# or in Python:
+# Decoder(weight_mode="autoround_int4", model_name="Intel/Qwen3.5-9B-int4-AutoRound")
+```
+
 **Requirements:**
 - NVIDIA GPU (Ampere+), tested on RTX 3090
 - CUDA 12+
 - PyTorch 2.0+
-- ~18–20 GB VRAM for BF16 weights (9B) plus KV / recurrence state
+- ~18–20 GB VRAM for BF16 weights (9B) plus KV / recurrence state; int4 checkpoint lowers **layer** VRAM but prefill scratch + bf16 lm_head still need headroom
 
 **Optional:** Set a power limit to find your GPU's sweet spot:
 ```bash
@@ -132,6 +141,7 @@ sudo nvidia-smi -pl 220    # or whatever your target wattage
 | `prefill.cu` | Prefill (cuBLAS + standalone kernels) |
 | `torch_bindings.cpp` | PyTorch C++ bindings |
 | `model.py` | Weight loading + decoder |
+| `autoround_load.py` | Merge HF shards + pack Intel AutoRound int4 for CUDA |
 | `setup.py` | Build configuration |
 | `bench_pp_tg.py` | Benchmark (prefill + decode) |
 | `RESULTS.md` | Full benchmark results and DVFS sweep |

@@ -33,13 +33,15 @@ LAYER_TYPE = [
 ]
 
 _decode = None
+_decode_w4 = None
 
 
-def _load_op():
-    global _decode
+def _load_ops():
+    global _decode, _decode_w4
     if _decode is None:
         import qwen35_megakernel_bf16_C
         _decode = torch.ops.qwen35_megakernel_bf16_C.decode
+        _decode_w4 = torch.ops.qwen35_megakernel_bf16_C.decode_w4
 
 
 def _extract_language_state_dict(model):
@@ -152,6 +154,16 @@ def load_weights(model_name="Qwen/Qwen3.5-9B", verbose=True):
     return weights, tokenizer
 
 
+def load_weights_intel_autoround(
+    model_name: str = "Intel/Qwen3.5-9B-int4-AutoRound",
+    verbose: bool = True,
+):
+    """Intel AutoRound int4 (`packing_format: auto_round:auto_gptq`). See `autoround_load.py`."""
+    from autoround_load import load_weights_autoround
+
+    return load_weights_autoround(model_name, verbose=verbose)
+
+
 def _pack_layer_weights(layer_data):
     """Pack layer weights into device blob matching LayerWeights struct."""
     ptr_size = 8
@@ -173,21 +185,41 @@ def _pack_layer_weights(layer_data):
 
 
 class Decoder:
-    """Stateful decoder for Qwen3.5-9B bf16 megakernel."""
+    """Stateful decoder for Qwen3.5-9B megakernel (bf16 or Intel AutoRound int4)."""
 
     def __init__(self, weights=None, tokenizer=None,
-                 model_name="Qwen/Qwen3.5-9B", verbose=True):
-        _load_op()
+                 model_name=None, verbose=True,
+                 weight_mode: str = "bf16"):
+        _load_ops()
 
         if weights is None:
-            weights, tokenizer = load_weights(model_name, verbose=verbose)
+            if weight_mode == "bf16":
+                mn = model_name or "Qwen/Qwen3.5-9B"
+                weights, tokenizer = load_weights(mn, verbose=verbose)
+            elif weight_mode in ("autoround_int4", "intel_autoround"):
+                mn = model_name or "Intel/Qwen3.5-9B-int4-AutoRound"
+                weights, tokenizer = load_weights_intel_autoround(mn, verbose=verbose)
+            else:
+                raise ValueError(f"Unknown weight_mode: {weight_mode}")
         self.tokenizer = tokenizer
         self._position = 0
         self._weights = weights
+        self._weight_mode = weights.get("weight_mode", weight_mode)
         self._embed_weight = weights["embed_weight"]
         self._final_norm_weight = weights["final_norm_weight"]
         self._lm_head_weight = weights["lm_head_weight"]
-        self._layer_weights_packed = _pack_layer_weights(weights["layer_data"])
+        if self._weight_mode == "bf16":
+            self._layer_weights_packed = _pack_layer_weights(weights["layer_data"])
+            self._run_decode = _decode
+            self._w_dequant_scratch = None
+        else:
+            self._layer_weights_packed = weights["layer_weights_packed"]
+            self._run_decode = _decode_w4
+            from autoround_load import max_dequant_bf16_elems
+
+            self._w_dequant_scratch = torch.empty(
+                max_dequant_bf16_elems(), dtype=torch.bfloat16, device="cuda"
+            )
 
         bf16 = dict(dtype=torch.bfloat16, device="cuda")
         f32 = dict(dtype=torch.float32, device="cuda")
@@ -229,7 +261,7 @@ class Decoder:
 
     def step(self, token_id: int) -> int:
         """Decode one token. Returns next token id."""
-        _decode(
+        self._run_decode(
             self._out_token, token_id,
             self._embed_weight, self._layer_weights_packed,
             self._final_norm_weight, self._lm_head_weight,
@@ -268,3 +300,66 @@ class Decoder:
                 break
             out.append(next_id)
         return self.tokenizer.decode(out, skip_special_tokens=True)
+
+    def prefill(self, token_ids_cuda: torch.Tensor, bufs: dict) -> int:
+        """Run prefill on GPU int32 token ids; `bufs` layout matches bench_pp_tg."""
+        if self._weight_mode == "bf16":
+            _pf = torch.ops.qwen35_megakernel_bf16_C.prefill_bf16
+            _pf(
+                self._out_token,
+                token_ids_cuda,
+                self._embed_weight,
+                self._layer_weights_packed,
+                self._final_norm_weight,
+                self._lm_head_weight,
+                self._fa_k_cache,
+                self._fa_v_cache,
+                self._dn_states,
+                self._conv_bufs,
+                bufs["hidden"],
+                bufs["residual"],
+                bufs["normalized"],
+                bufs["proj_buf"],
+                bufs["proj_buf2"],
+                bufs["attn_buf"],
+                bufs["mlp_buf"],
+                bufs["dn_out_buf"],
+                bufs["beta_buf"],
+                bufs["alpha_buf"],
+                bufs["final_normed"],
+                bufs["hidden_bf16_out"],
+                bufs["lm_bmv"],
+                bufs["lm_bmi"],
+            )
+        else:
+            _pf = torch.ops.qwen35_megakernel_bf16_C.prefill_w4
+            _pf(
+                self._out_token,
+                token_ids_cuda,
+                self._embed_weight,
+                self._layer_weights_packed,
+                self._final_norm_weight,
+                self._lm_head_weight,
+                self._fa_k_cache,
+                self._fa_v_cache,
+                self._dn_states,
+                self._conv_bufs,
+                bufs["hidden"],
+                bufs["residual"],
+                bufs["normalized"],
+                bufs["proj_buf"],
+                bufs["proj_buf2"],
+                bufs["attn_buf"],
+                bufs["mlp_buf"],
+                bufs["dn_out_buf"],
+                bufs["beta_buf"],
+                bufs["alpha_buf"],
+                bufs["final_normed"],
+                bufs["hidden_bf16_out"],
+                bufs["lm_bmv"],
+                bufs["lm_bmi"],
+                self._w_dequant_scratch,
+            )
+        self._hidden.copy_(bufs["hidden_bf16_out"])
+        self._position = int(token_ids_cuda.numel())
+        return self._out_token.item()
