@@ -3,3 +3,7 @@ __pycache__/
 temp_reap/
 .modal/
 .env
+
+# Offline knowledge distillation outputs (large tensor shards)
+knowledge_distillation/teacher_data/
+knowledge_distillation/healed_student/
