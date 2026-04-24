@@ -3,6 +3,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import time
 import zipfile
 
 import modal
@@ -32,6 +33,7 @@ def download_and_test_dflash(
     draft_model_repo: str = "spiritbuun/Qwen3.5-27B-DFlash-GGUF",
     draft_model_file: str = "dflash-draft-q4_k_m.gguf",
     prompt: str = "Write a concise Python mergesort implementation.",
+    max_tokens: int = 64,
 ):
     from huggingface_hub import hf_hub_download
 
@@ -53,13 +55,17 @@ def download_and_test_dflash(
 
     bin_dir = extract_dir / "bin"
     spec_bin = bin_dir / "llama-speculative-simple"
+    cli_bin = bin_dir / "llama-cli"
     server_bin = bin_dir / "llama-server"
     if not spec_bin.exists():
         raise FileNotFoundError(f"Missing binary: {spec_bin}")
+    if not cli_bin.exists():
+        raise FileNotFoundError(f"Missing binary: {cli_bin}")
     if not server_bin.exists():
         raise FileNotFoundError(f"Missing binary: {server_bin}")
 
     os.chmod(spec_bin, 0o755)
+    os.chmod(cli_bin, 0o755)
     os.chmod(server_bin, 0o755)
 
     print(
@@ -82,7 +88,7 @@ def download_and_test_dflash(
     print(f"Running: {' '.join(version_cmd)}")
     version_res = subprocess.run(version_cmd, capture_output=True, text=True, check=True)
 
-    test_cmd = [
+    spec_cmd = [
         str(spec_bin),
         "-m",
         target_model_path,
@@ -101,24 +107,55 @@ def download_and_test_dflash(
         "--draft-min",
         "1",
         "-n",
-        "96",
+        str(max_tokens),
         "-p",
         prompt,
     ]
-    print(f"Running DFlash smoke test: {' '.join(test_cmd)}")
-    result = subprocess.run(test_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
+    print(f"Running DFlash smoke test: {' '.join(spec_cmd)}")
+    spec_start = time.monotonic()
+    spec_result = subprocess.run(spec_cmd, capture_output=True, text=True)
+    spec_duration_s = round(time.monotonic() - spec_start, 2)
+    if spec_result.returncode != 0:
         raise RuntimeError(
             "DFlash smoke test failed.\n"
-            f"Exit code: {result.returncode}\n"
-            f"STDERR:\n{result.stderr}\n"
-            f"STDOUT:\n{result.stdout}"
+            f"Exit code: {spec_result.returncode}\n"
+            f"STDERR:\n{spec_result.stderr}\n"
+            f"STDOUT:\n{spec_result.stdout}"
         )
 
-    stdout_tail = result.stdout[-4000:]
-    stderr_tail = result.stderr[-2000:]
+    cli_cmd = [
+        str(cli_bin),
+        "-m",
+        target_model_path,
+        "-ngl",
+        "99",
+        "-c",
+        "2048",
+        "-n",
+        str(max_tokens),
+        "-p",
+        prompt,
+    ]
+    print(f"Running non-spec smoke test: {' '.join(cli_cmd)}")
+    cli_start = time.monotonic()
+    cli_result = subprocess.run(cli_cmd, capture_output=True, text=True)
+    cli_duration_s = round(time.monotonic() - cli_start, 2)
+    if cli_result.returncode != 0:
+        raise RuntimeError(
+            "Non-spec smoke test failed.\n"
+            f"Exit code: {cli_result.returncode}\n"
+            f"STDERR:\n{cli_result.stderr}\n"
+            f"STDOUT:\n{cli_result.stdout}"
+        )
+
+    spec_stdout_tail = spec_result.stdout[-3000:]
+    spec_stderr_tail = spec_result.stderr[-2000:]
+    cli_stdout_tail = cli_result.stdout[-3000:]
+    cli_stderr_tail = cli_result.stderr[-2000:]
     print("DFlash smoke test completed successfully.")
-    print(stdout_tail)
+    print(spec_stdout_tail)
+    print("Non-spec smoke test completed successfully.")
+    print(cli_stdout_tail)
 
     return {
         "build_repo": build_repo,
@@ -127,9 +164,18 @@ def download_and_test_dflash(
         "target_model_file": target_model_file,
         "draft_model_repo": draft_model_repo,
         "draft_model_file": draft_model_file,
+        "max_tokens": max_tokens,
         "spec_binary_version_tail": version_res.stdout[-1000:],
-        "stdout_tail": stdout_tail,
-        "stderr_tail": stderr_tail,
+        "with_speculative": {
+            "duration_seconds": spec_duration_s,
+            "stdout_tail": spec_stdout_tail,
+            "stderr_tail": spec_stderr_tail,
+        },
+        "without_speculative": {
+            "duration_seconds": cli_duration_s,
+            "stdout_tail": cli_stdout_tail,
+            "stderr_tail": cli_stderr_tail,
+        },
     }
 
 
@@ -142,6 +188,7 @@ def main(
     draft_model_repo: str = "spiritbuun/Qwen3.5-27B-DFlash-GGUF",
     draft_model_file: str = "dflash-draft-q4_k_m.gguf",
     prompt: str = "Write a concise Python mergesort implementation.",
+    max_tokens: int = 64,
 ):
     output = download_and_test_dflash.remote(
         build_repo=build_repo,
@@ -151,6 +198,7 @@ def main(
         draft_model_repo=draft_model_repo,
         draft_model_file=draft_model_file,
         prompt=prompt,
+        max_tokens=max_tokens,
     )
     print("DFlash build test finished.")
     print(json.dumps(output, indent=2))
