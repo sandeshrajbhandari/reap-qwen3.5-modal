@@ -8,7 +8,7 @@ import subprocess
 import modal
 
 
-app = modal.App("llama-cpp-build-upload-t4")
+app = modal.App("buun-llama-cpp-build-upload-t4")
 
 image = (
     modal.Image.from_registry(
@@ -28,7 +28,8 @@ image = (
 def build_and_upload(
     hf_repo: str,
     llama_ref: str = "master",
-    artifact_prefix: str = "llama.cpp-cuda-t4",
+    llama_repo_url: str = "https://github.com/spiritbuun/buun-llama-cpp.git",
+    artifact_prefix: str = "buun-llama-cpp-dflash-cuda-t4",
 ):
     from huggingface_hub import HfApi
 
@@ -40,9 +41,9 @@ def build_and_upload(
     package_root = pathlib.Path("/tmp/llama-cpp-build")
     binaries_dir = package_root / "bin"
 
-    print(f"Cloning llama.cpp at ref '{llama_ref}'...")
+    print(f"Cloning llama.cpp fork from {llama_repo_url} at ref '{llama_ref}'...")
     subprocess.run(
-        ["git", "clone", "https://github.com/ggml-org/llama.cpp.git", str(llama_src)],
+        ["git", "clone", llama_repo_url, str(llama_src)],
         check=True,
     )
     subprocess.run(["git", "checkout", llama_ref], check=True, cwd=llama_src)
@@ -63,7 +64,9 @@ def build_and_upload(
             str(build_dir),
             "-DCMAKE_BUILD_TYPE=Release",
             "-DGGML_CUDA=ON",
-            "-DLLAMA_CURL=ON",
+            "-DGGML_NATIVE=ON",
+            "-DGGML_CUDA_FA=ON",
+            "-DGGML_CUDA_FA_ALL_QUANTS=ON",
             "-DBUILD_SHARED_LIBS=OFF",
         ],
         check=True,
@@ -78,7 +81,12 @@ def build_and_upload(
     binaries_dir.mkdir(parents=True, exist_ok=True)
 
     bin_root = build_dir / "bin"
-    required_bins = ["llama-cli", "llama-quantize", "llama-server"]
+    required_bins = [
+        "llama-cli",
+        "llama-quantize",
+        "llama-server",
+        "llama-speculative-simple",
+    ]
     missing_bins = [name for name in required_bins if not (bin_root / name).exists()]
     if missing_bins:
         raise FileNotFoundError(
@@ -97,10 +105,18 @@ def build_and_upload(
     shutil.copy2(llama_src / "LICENSE", package_root / "LICENSE")
 
     metadata = {
+        "llama_cpp_repo": llama_repo_url,
         "llama_cpp_ref": llama_ref,
         "llama_cpp_commit": short_sha,
         "built_at_utc": datetime.datetime.utcnow().isoformat() + "Z",
         "gpu_type": "T4",
+        "cmake_flags": [
+            "-DGGML_CUDA=ON",
+            "-DGGML_NATIVE=ON",
+            "-DGGML_CUDA_FA=ON",
+            "-DGGML_CUDA_FA_ALL_QUANTS=ON",
+            "-DBUILD_SHARED_LIBS=OFF",
+        ],
     }
     with open(package_root / "build-metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -149,7 +165,8 @@ def build_and_upload(
 def main(
     hf_repo: str = "",
     llama_ref: str = "master",
-    artifact_prefix: str = "llama.cpp-cuda-t4",
+    llama_repo_url: str = "https://github.com/spiritbuun/buun-llama-cpp.git",
+    artifact_prefix: str = "buun-llama-cpp-dflash-cuda-t4",
 ):
     if not hf_repo:
         raise ValueError(
@@ -159,6 +176,7 @@ def main(
     result = build_and_upload.remote(
         hf_repo=hf_repo,
         llama_ref=llama_ref,
+        llama_repo_url=llama_repo_url,
         artifact_prefix=artifact_prefix,
     )
     print("Build + upload completed.")
