@@ -30,6 +30,7 @@ def build_and_upload(
     llama_ref: str = "master",
     llama_repo_url: str = "https://github.com/spiritbuun/buun-llama-cpp.git",
     artifact_prefix: str = "buun-llama-cpp-dflash-cuda-t4",
+    cuda_architectures: str = "75",
 ):
     from huggingface_hub import HfApi
 
@@ -67,6 +68,7 @@ def build_and_upload(
             "-DGGML_NATIVE=ON",
             "-DGGML_CUDA_FA=ON",
             "-DGGML_CUDA_FA_ALL_QUANTS=ON",
+            f"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}",
             "-DBUILD_SHARED_LIBS=OFF",
         ],
         check=True,
@@ -115,6 +117,7 @@ def build_and_upload(
             "-DGGML_NATIVE=ON",
             "-DGGML_CUDA_FA=ON",
             "-DGGML_CUDA_FA_ALL_QUANTS=ON",
+            f"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}",
             "-DBUILD_SHARED_LIBS=OFF",
         ],
     }
@@ -167,6 +170,7 @@ def main(
     llama_ref: str = "master",
     llama_repo_url: str = "https://github.com/spiritbuun/buun-llama-cpp.git",
     artifact_prefix: str = "buun-llama-cpp-dflash-cuda-t4",
+    cuda_architectures: str = "75",
 ):
     if not hf_repo:
         raise ValueError(
@@ -178,6 +182,7 @@ def main(
         llama_ref=llama_ref,
         llama_repo_url=llama_repo_url,
         artifact_prefix=artifact_prefix,
+        cuda_architectures=cuda_architectures,
     )
     print("Build + upload completed.")
     print(json.dumps(result, indent=2))
