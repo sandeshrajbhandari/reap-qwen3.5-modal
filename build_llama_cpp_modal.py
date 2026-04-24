@@ -4,6 +4,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import zipfile
 
 import modal
 
@@ -95,16 +96,21 @@ def build_and_upload(
             f"Missing expected binaries after build: {', '.join(missing_bins)}"
         )
 
-    print("Copying binaries into package...")
-    for path in bin_root.iterdir():
-        if path.is_file():
-            shutil.copy2(path, binaries_dir / path.name)
+    print("Copying selected binaries into package...")
+    copied_files: list[pathlib.Path] = []
+    for binary_name in required_bins:
+        src = bin_root / binary_name
+        dst = binaries_dir / binary_name
+        print(f"  - copy {binary_name}")
+        shutil.copy2(src, dst)
+        os.chmod(dst, 0o755)
+        copied_files.append(dst)
 
-    shutil.copy2(
-        llama_src / "convert_hf_to_gguf.py",
-        package_root / "convert_hf_to_gguf.py",
-    )
-    shutil.copy2(llama_src / "LICENSE", package_root / "LICENSE")
+    convert_script = package_root / "convert_hf_to_gguf.py"
+    license_file = package_root / "LICENSE"
+    shutil.copy2(llama_src / "convert_hf_to_gguf.py", convert_script)
+    shutil.copy2(llama_src / "LICENSE", license_file)
+    copied_files.extend([convert_script, license_file])
 
     metadata = {
         "llama_cpp_repo": llama_repo_url,
@@ -126,21 +132,31 @@ def build_and_upload(
 
     timestamp = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     artifact_name = f"{artifact_prefix}-{timestamp}-{short_sha}.zip"
-    artifact_base = f"/tmp/{artifact_name.removesuffix('.zip')}"
-    artifact_zip = f"{artifact_base}.zip"
-    shutil.make_archive(artifact_base, "zip", root_dir=package_root)
+    artifact_zip = pathlib.Path(f"/tmp/{artifact_name}")
+    print(f"Creating zip package at {artifact_zip} ...")
+    with zipfile.ZipFile(artifact_zip, "w", compression=zipfile.ZIP_STORED) as zf:
+        for file_path in copied_files:
+            arcname = file_path.relative_to(package_root)
+            zf.write(file_path, arcname=arcname)
+        zf.write(
+            package_root / "build-metadata.json",
+            arcname="build-metadata.json",
+        )
+    print(f"Zip creation complete ({artifact_zip.stat().st_size / (1024 ** 2):.2f} MiB).")
 
     api = HfApi()
     api.create_repo(repo_id=hf_repo, repo_type="model", exist_ok=True)
 
     path_in_repo = f"builds/{artifact_name}"
     print(f"Uploading {artifact_name} to https://huggingface.co/{hf_repo} ...")
+    print(f"Starting upload of zip artifact to {path_in_repo} ...")
     api.upload_file(
-        path_or_fileobj=artifact_zip,
+        path_or_fileobj=str(artifact_zip),
         path_in_repo=path_in_repo,
         repo_id=hf_repo,
         repo_type="model",
     )
+    print("Zip upload complete.")
 
     latest_file = "/tmp/latest.txt"
     with open(latest_file, "w", encoding="utf-8") as f:
