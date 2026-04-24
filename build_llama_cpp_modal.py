@@ -38,6 +38,34 @@ def build_and_upload(
     if not hf_repo:
         raise ValueError("hf_repo is required (example: username/llama-cpp-builds)")
 
+    api = HfApi()
+    api.create_repo(repo_id=hf_repo, repo_type="model", exist_ok=True)
+
+    # Fail fast before spending build time if the secret token can't write to the repo.
+    probe_path = f"builds/.write-check-{datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt"
+    probe_file = pathlib.Path("/tmp/hf-write-check.txt")
+    probe_file.write_text("write-check\n", encoding="utf-8")
+    print(f"Running Hugging Face write-access preflight check for {hf_repo} ...")
+    try:
+        api.upload_file(
+            path_or_fileobj=str(probe_file),
+            path_in_repo=probe_path,
+            repo_id=hf_repo,
+            repo_type="model",
+        )
+        api.delete_file(
+            path_in_repo=probe_path,
+            repo_id=hf_repo,
+            repo_type="model",
+            commit_message="cleanup write-access preflight probe",
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Write-access preflight failed for repo '{hf_repo}'. "
+            "Ensure the Modal secret token has write permission to this repository."
+        ) from exc
+    print("Write-access preflight check passed.")
+
     llama_src = pathlib.Path("/tmp/llama.cpp")
     build_dir = llama_src / "build"
     package_root = pathlib.Path("/tmp/llama-cpp-build")
@@ -143,9 +171,6 @@ def build_and_upload(
             arcname="build-metadata.json",
         )
     print(f"Zip creation complete ({artifact_zip.stat().st_size / (1024 ** 2):.2f} MiB).")
-
-    api = HfApi()
-    api.create_repo(repo_id=hf_repo, repo_type="model", exist_ok=True)
 
     path_in_repo = f"builds/{artifact_name}"
     print(f"Uploading {artifact_name} to https://huggingface.co/{hf_repo} ...")
