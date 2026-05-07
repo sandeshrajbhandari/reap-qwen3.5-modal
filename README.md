@@ -34,6 +34,7 @@ modal run generate_imatrix.py --rebuild # First run needs --rebuild
 - **`quantize_modal_IQ.py`**: Implements the "Unsloth-style" recipe. It forces critical tensors (attention gates, shared experts) into 8-bit while quantizing the rest to 4-bit.
 - **`quantize_modal_IQS.py`**: Variant for `IQ4_K_S` quantization.
 - **`quantize_modal_IQ3_S.py`**: Multimodal-aware `IQ3_S` recipe with tensor-level overrides (e.g. `ffn_down_exps=IQ3_S`, `ffn_gate_exps/ffn_up_exps=IQ2_S`, key projections in `Q6_K`).
+- **`quantize_qwen35_9b_gguf_modal.py`**: ik_llama.cpp-based CPU workflow for `Qwen/Qwen3.5-9B`; converts the HF checkpoint to `Q8_0` GGUF with ik_llama's `convert_hf_to_gguf.py`, then requantizes to `Q4_K_M` using the Qwen3.5-9B tensor recipe (`attn_qkv=Q5_K`, `ffn_down=Q6_K`, SSM state tensors in higher precision, and optional MTP/nextn block preservation).
 
 ```bash
 modal run quantize_modal_IQ.py --hf-repo username/model-GGUF
@@ -46,6 +47,11 @@ modal run quantize_modal_IQ3_S.py \
   --generate-imatrix-if-missing true \
   --mmproj-quant "f16" \
   --hf-repo username/model-IQ3S-GGUF
+```
+
+```bash
+modal run quantize_qwen35_9b_gguf_modal.py \
+  --hf-repo username/Qwen3.5-9B-GGUF
 ```
 
 For multimodal checkpoints, keep/use a matching `mmproj` file. The script now handles this flow:
