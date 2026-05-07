@@ -27,11 +27,6 @@ IK_LLAMA_BUILD_DIR = os.path.join(IK_LLAMA_DIR, "build")
 IK_LLAMA_BIN_DIR = os.path.join(IK_LLAMA_BUILD_DIR, "bin")
 
 DEFAULT_SOURCE_REPO = "Radamanthys11/Qwen3.6-27B-MTP-Q8_0-GGUF"
-DEFAULT_CALIBRATION_URL = (
-    "https://gist.githubusercontent.com/ubergarm/edfeb3ff9c6ec8b49e88cdf627b0711a/raw/"
-    "ba5b01b6960a86874592f5913e283746ff734483/ubergarm-imatrix-calibration-corpus-v02.txt"
-)
-IMATRIX_FILENAME = "Qwen3.6-27B-MTP-imatrix.dat"
 
 
 def default_output_name(source_repo: str) -> str:
@@ -44,8 +39,8 @@ def default_output_name(source_repo: str) -> str:
 
 
 def custom_q3ks_rules() -> str:
-    # Q3_K_S stores main attention/FFN tensors as Q3_K. These overrides keep the
-    # Qwen hybrid SSM tensors aligned with the public Unsloth-style layout.
+    # Match the public Q3_K_S-style tensor layout while keeping Qwen hybrid SSM
+    # tensors from being over-quantized.
     rules = [
         r"blk\..*\.ssm_alpha\.weight=f32",
         r"blk\..*\.ssm_beta\.weight=f32",
@@ -61,7 +56,81 @@ def custom_q3ks_rules() -> str:
 
 @app.function(
     image=image,
-    gpu="A100-80GB",
+    gpu="T4",
+    volumes={RESULTS_DIR: results_vol},
+    timeout=14400,
+)
+def build_ik_llama_cpp(force_rebuild_ik_llama: bool = False, threads: int = 16):
+    import shutil
+    import subprocess
+
+    def run(cmd, *, cwd=None):
+        print(f"Running command: {' '.join(cmd)}")
+        result = subprocess.run(cmd, text=True, cwd=cwd)
+        if result.returncode != 0:
+            raise RuntimeError(f"Command failed with exit code {result.returncode}: {' '.join(cmd)}")
+        return result
+
+    quantize_bin = os.path.join(IK_LLAMA_BIN_DIR, "llama-quantize")
+    if not force_rebuild_ik_llama and os.path.exists(quantize_bin):
+        os.chmod(quantize_bin, 0o755)
+        print(f"✅ Using existing ik_llama.cpp quantizer at {quantize_bin}")
+        return
+
+    if force_rebuild_ik_llama and os.path.exists(IK_LLAMA_DIR):
+        print(f"🧹 Removing existing ik_llama.cpp checkout: {IK_LLAMA_DIR}")
+        shutil.rmtree(IK_LLAMA_DIR)
+    elif os.path.exists(IK_LLAMA_BUILD_DIR):
+        print(f"🧹 Removing interrupted/stale ik_llama.cpp build dir: {IK_LLAMA_BUILD_DIR}")
+        shutil.rmtree(IK_LLAMA_BUILD_DIR)
+
+    if not os.path.exists(IK_LLAMA_DIR):
+        os.makedirs(os.path.dirname(IK_LLAMA_DIR), exist_ok=True)
+        print(f"⬇️ Cloning ik_llama.cpp from {IK_LLAMA_REPO}")
+        run(["git", "clone", IK_LLAMA_REPO, IK_LLAMA_DIR])
+    else:
+        print(f"🔄 Updating existing ik_llama.cpp checkout: {IK_LLAMA_DIR}")
+        run(["git", "fetch", "--depth", "1", "origin"], cwd=IK_LLAMA_DIR)
+        run(["git", "pull", "--ff-only"], cwd=IK_LLAMA_DIR)
+
+    os.makedirs(IK_LLAMA_BUILD_DIR, exist_ok=True)
+    run(
+        [
+            "cmake",
+            "-S",
+            IK_LLAMA_DIR,
+            "-B",
+            IK_LLAMA_BUILD_DIR,
+            "-DGGML_CUDA=ON",
+            "-DLLAMA_CURL=ON",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_CUDA_ARCHITECTURES=75;80",
+        ]
+    )
+    run(
+        [
+            "cmake",
+            "--build",
+            IK_LLAMA_BUILD_DIR,
+            "--config",
+            "Release",
+            "--target",
+            "llama-quantize",
+            "-j",
+            str(threads),
+        ]
+    )
+
+    if not os.path.exists(quantize_bin):
+        raise FileNotFoundError(f"ik_llama.cpp build did not produce {quantize_bin}")
+    os.chmod(quantize_bin, 0o755)
+    results_vol.commit()
+    print(f"🎉 ik_llama.cpp T4 build ready: {quantize_bin}")
+
+
+@app.function(
+    image=image,
+    gpu="T4",
     volumes={RESULTS_DIR: results_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=43200,
@@ -71,17 +140,10 @@ def run_qwen36_mtp_q3ks_quantization(
     hf_repo: str = "",
     source_filename: str = "",
     output_filename: str = "",
-    calibration_url: str = DEFAULT_CALIBRATION_URL,
-    generate_imatrix: bool = True,
-    force_rebuild_ik_llama: bool = False,
-    force_imatrix: bool = False,
     force_quantize: bool = False,
     threads: int = 16,
-    upload_imatrix: bool = True,
 ):
-    import shutil
     import subprocess
-    import urllib.request
     from pathlib import Path
 
     from huggingface_hub import HfApi, snapshot_download
@@ -92,57 +154,6 @@ def run_qwen36_mtp_q3ks_quantization(
         if result.returncode != 0:
             raise RuntimeError(f"Command failed with exit code {result.returncode}: {' '.join(cmd)}")
         return result
-
-    def ensure_ik_llama_cpp():
-        quantize_bin = os.path.join(IK_LLAMA_BIN_DIR, "llama-quantize")
-        imatrix_bin = os.path.join(IK_LLAMA_BIN_DIR, "llama-imatrix")
-        if (
-            not force_rebuild_ik_llama
-            and os.path.exists(quantize_bin)
-            and os.path.exists(imatrix_bin)
-        ):
-            print(f"✅ Using existing ik_llama.cpp build at {IK_LLAMA_BIN_DIR}")
-            os.chmod(quantize_bin, 0o755)
-            os.chmod(imatrix_bin, 0o755)
-            return quantize_bin, imatrix_bin
-
-        if force_rebuild_ik_llama and os.path.exists(IK_LLAMA_DIR):
-            print(f"🧹 Removing existing ik_llama.cpp checkout: {IK_LLAMA_DIR}")
-            shutil.rmtree(IK_LLAMA_DIR)
-
-        if not os.path.exists(IK_LLAMA_DIR):
-            os.makedirs(os.path.dirname(IK_LLAMA_DIR), exist_ok=True)
-            print(f"⬇️ Cloning ik_llama.cpp from {IK_LLAMA_REPO}")
-            run(["git", "clone", IK_LLAMA_REPO, IK_LLAMA_DIR])
-        else:
-            print(f"🔄 Updating existing ik_llama.cpp checkout: {IK_LLAMA_DIR}")
-            run(["git", "fetch", "--depth", "1", "origin"], cwd=IK_LLAMA_DIR)
-            run(["git", "pull", "--ff-only"], cwd=IK_LLAMA_DIR)
-
-        os.makedirs(IK_LLAMA_BUILD_DIR, exist_ok=True)
-        run(
-            [
-                "cmake",
-                "-S",
-                IK_LLAMA_DIR,
-                "-B",
-                IK_LLAMA_BUILD_DIR,
-                "-DGGML_CUDA=ON",
-                "-DLLAMA_CURL=ON",
-                "-DCMAKE_BUILD_TYPE=Release",
-            ]
-        )
-        run(["cmake", "--build", IK_LLAMA_BUILD_DIR, "--config", "Release", "-j", str(threads)])
-
-        if not os.path.exists(quantize_bin) or not os.path.exists(imatrix_bin):
-            raise FileNotFoundError(
-                f"ik_llama.cpp build did not produce required binaries under {IK_LLAMA_BIN_DIR}"
-            )
-        os.chmod(quantize_bin, 0o755)
-        os.chmod(imatrix_bin, 0o755)
-        results_vol.commit()
-        print(f"🎉 ik_llama.cpp build ready at {IK_LLAMA_BIN_DIR}")
-        return quantize_bin, imatrix_bin
 
     def find_source_gguf(source_dir: str) -> str:
         if source_filename:
@@ -157,9 +168,15 @@ def run_qwen36_mtp_q3ks_quantization(
                 candidates.append(path)
         if not candidates:
             raise FileNotFoundError(f"No Q8_0 GGUF files found in {source_dir}")
-        return str(max(candidates, key=lambda p: p.stat().st_size))
+        return str(max(candidates, key=lambda path: path.stat().st_size))
 
-    quantize_bin, imatrix_bin = ensure_ik_llama_cpp()
+    quantize_bin = os.path.join(IK_LLAMA_BIN_DIR, "llama-quantize")
+    if not os.path.exists(quantize_bin):
+        raise FileNotFoundError(
+            f"llama-quantize not found at {quantize_bin}. "
+            "Run the default entrypoint first so build_ik_llama_cpp runs on T4."
+        )
+    os.chmod(quantize_bin, 0o755)
 
     source_dir = os.path.join(RESULTS_DIR, "hf-snapshots", hf_source_repo.replace("/", "__"))
     os.makedirs(source_dir, exist_ok=True)
@@ -178,48 +195,12 @@ def run_qwen36_mtp_q3ks_quantization(
     if not output_filename:
         output_filename = default_output_name(hf_source_repo)
     output_path = os.path.join(source_dir, output_filename)
-    imatrix_path = os.path.join(source_dir, IMATRIX_FILENAME)
-
-    if generate_imatrix:
-        if force_imatrix or not os.path.exists(imatrix_path):
-            calibration_path = "/tmp/ubergarm-imatrix-calibration-corpus-v02.txt"
-            print(f"⬇️ Downloading calibration corpus from {calibration_url}")
-            urllib.request.urlretrieve(calibration_url, calibration_path)
-
-            imatrix_env = os.environ.copy()
-            imatrix_env["GGML_CUDA_NO_PINNED"] = "1"
-            imatrix_cmd = [
-                imatrix_bin,
-                "-m",
-                source_gguf,
-                "-f",
-                calibration_path,
-                "-o",
-                imatrix_path,
-                "--ctx-size",
-                "512",
-                "-t",
-                str(threads),
-                "--fit",
-            ]
-            print("𓌳 Generating imatrix from Q8_0 source with GGML_CUDA_NO_PINNED=1")
-            run(imatrix_cmd, env=imatrix_env)
-            results_vol.commit()
-            print(f"✅ Imatrix ready: {imatrix_path}")
-        else:
-            print(f"✅ Reusing existing imatrix: {imatrix_path}")
-    elif not os.path.exists(imatrix_path):
-        raise FileNotFoundError(
-            f"Imatrix not found at {imatrix_path}; rerun with generate_imatrix=True."
-        )
 
     custom_q = custom_q3ks_rules()
     if force_quantize or not os.path.exists(output_path):
         quantize_cmd = [
             quantize_bin,
             "--allow-requantize",
-            "--imatrix",
-            imatrix_path,
             "--custom-q",
             custom_q,
             source_gguf,
@@ -227,7 +208,7 @@ def run_qwen36_mtp_q3ks_quantization(
             "Q3_K_S",
             str(threads),
         ]
-        print(f"📦 Starting Q3_K_S requantization for {output_filename}")
+        print(f"📦 Starting plain Q3_K_S requantization for {output_filename}")
         run(quantize_cmd)
         results_vol.commit()
         print(f"✅ Quantization complete: {output_path}")
@@ -246,13 +227,6 @@ def run_qwen36_mtp_q3ks_quantization(
         path_in_repo=output_filename,
         repo_id=hf_repo,
     )
-
-    if upload_imatrix:
-        api.upload_file(
-            path_or_fileobj=imatrix_path,
-            path_in_repo=os.path.basename(imatrix_path),
-            repo_id=hf_repo,
-        )
 
     readme_path = "/tmp/Qwen3.6-27B-MTP-Q3_K_S-README.md"
     readme = f"""\
@@ -274,9 +248,10 @@ def run_qwen36_mtp_q3ks_quantization(
 
     # Qwen3.6-27B-MTP Q3_K_S GGUF
 
-    This is a Q3_K_S GGUF quantization of Qwen3.6-27B that preserves the MTP
-    (Multi-Token Prediction) tensors from `{hf_source_repo}`. It was requantized
-    from the Q8_0 GGUF source with `ik_llama.cpp` using `--allow-requantize`.
+    This is a plain Q3_K_S GGUF quantization of Qwen3.6-27B that preserves the
+    MTP (Multi-Token Prediction) tensors from `{hf_source_repo}`. It was
+    requantized from the Q8_0 GGUF source with `ik_llama.cpp` using
+    `--allow-requantize`.
 
     ## Requirements
 
@@ -289,23 +264,15 @@ def run_qwen36_mtp_q3ks_quantization(
 
     ## Quantization Recipe
 
-    The quantization was generated from the Q8_0 source rather than directly from
-    fp16, so a small amount of accuracy may have been lost before this Q3_K_S pass.
+    This quant was made from Q8_0 rather than directly from fp16, so a small
+    amount of accuracy may have been lost before this Q3_K_S pass. No imatrix
+    was generated or used for this normal K-quant.
 
     ```bash
-    GGML_CUDA_NO_PINNED=1 ./ik_llama.cpp/build/bin/llama-imatrix \\
-      -m ./Qwen3.6-27B-MTP-Q8_0.gguf \\
-      -f ./ubergarm-imatrix-calibration-corpus-v02.txt \\
-      -o ./{IMATRIX_FILENAME} \\
-      --ctx-size 512 \\
-      -t {threads} \\
-      --fit
-
     custom="{custom_q}"
 
     ./ik_llama.cpp/build/bin/llama-quantize \\
       --allow-requantize \\
-      --imatrix ./{IMATRIX_FILENAME} \\
       --custom-q "$custom" \\
       ./Qwen3.6-27B-MTP-Q8_0.gguf \\
       ./{output_filename} \\
@@ -335,24 +302,23 @@ def main(
     hf_repo: str = "",
     source_filename: str = "",
     output_filename: str = "",
-    calibration_url: str = DEFAULT_CALIBRATION_URL,
-    generate_imatrix: bool = True,
     force_rebuild_ik_llama: bool = False,
-    force_imatrix: bool = False,
     force_quantize: bool = False,
     threads: int = 16,
-    upload_imatrix: bool = True,
+    build_only: bool = False,
 ):
+    build_ik_llama_cpp.remote(
+        force_rebuild_ik_llama=force_rebuild_ik_llama,
+        threads=threads,
+    )
+    if build_only:
+        return
+
     run_qwen36_mtp_q3ks_quantization.remote(
         hf_source_repo=hf_source_repo,
         hf_repo=hf_repo,
         source_filename=source_filename,
         output_filename=output_filename,
-        calibration_url=calibration_url,
-        generate_imatrix=generate_imatrix,
-        force_rebuild_ik_llama=force_rebuild_ik_llama,
-        force_imatrix=force_imatrix,
         force_quantize=force_quantize,
         threads=threads,
-        upload_imatrix=upload_imatrix,
     )
