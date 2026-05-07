@@ -48,7 +48,7 @@ CONVERT_SCRIPTS = [
     image=image,
     gpu="T4",
     secrets=[modal.Secret.from_name("huggingface-secret")],
-    timeout=7200,
+    timeout=14400,
 )
 def build_smoke_test_and_upload(
     hf_repo: str,
