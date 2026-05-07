@@ -151,19 +151,28 @@ def run_qwen36_mtp_q3ks_quantization(
     threads: int = 16,
 ):
     import subprocess
-    import threading
     from pathlib import Path
+    from urllib.parse import quote
 
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "0")
 
-    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub import HfApi
 
     def run(cmd, *, env=None, cwd=None):
-        print(f"Running command: {' '.join(cmd)}")
+        display_cmd = [
+            "--header=Authorization: Bearer [REDACTED]"
+            if part.startswith("--header=Authorization: Bearer ")
+            else part
+            for part in cmd
+        ]
+        print(f"Running command: {' '.join(display_cmd)}")
         result = subprocess.run(cmd, text=True, env=env, cwd=cwd)
         if result.returncode != 0:
-            raise RuntimeError(f"Command failed with exit code {result.returncode}: {' '.join(cmd)}")
+            raise RuntimeError(
+                f"Command failed with exit code {result.returncode}: {' '.join(display_cmd)}"
+            )
         return result
 
     def find_source_gguf(source_dir: str) -> str:
@@ -210,45 +219,40 @@ def run_qwen36_mtp_q3ks_quantization(
     source_dir = os.path.join(RESULTS_DIR, "hf-snapshots", hf_source_repo.replace("/", "__"))
     os.makedirs(source_dir, exist_ok=True)
 
-    download_done = threading.Event()
+    token = (
+        os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    )
+    for sibling in gguf_siblings:
+        target_path = os.path.join(source_dir, sibling.rfilename)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        expected_size = sibling.size or 0
+        if expected_size and os.path.exists(target_path) and os.path.getsize(target_path) >= expected_size:
+            print(f"✅ Reusing cached GGUF: {target_path}", flush=True)
+            continue
 
-    def current_download_size() -> int:
-        total = 0
-        for path in Path(source_dir).rglob("*"):
-            try:
-                if path.is_file():
-                    total += path.stat().st_size
-            except OSError:
-                pass
-        return total
+        url = f"https://huggingface.co/{hf_source_repo}/resolve/main/{quote(sibling.rfilename)}"
+        wget_cmd = [
+            "wget",
+            "--continue",
+            "--progress=dot:giga",
+            "--tries=20",
+            "--timeout=30",
+            "--read-timeout=30",
+            "--waitretry=5",
+            "-O",
+            target_path,
+            url,
+        ]
+        if token:
+            wget_cmd.insert(1, f"--header=Authorization: Bearer {token}")
+        print(f"⬇️ Resumable direct GGUF download: {sibling.rfilename}", flush=True)
+        run(wget_cmd)
 
-    def log_download_progress():
-        while not download_done.wait(30):
-            downloaded = current_download_size()
-            if expected_bytes:
-                pct = downloaded / expected_bytes * 100
-                print(
-                    f"⬇️ GGUF download progress: {downloaded / (1024**3):.2f} / "
-                    f"{expected_bytes / (1024**3):.2f} GiB ({pct:.1f}%)",
-                    flush=True,
-                )
-            else:
-                print(f"⬇️ GGUF download progress: {downloaded / (1024**3):.2f} GiB", flush=True)
-
-    progress_thread = threading.Thread(target=log_download_progress, daemon=True)
-    progress_thread.start()
-    try:
-        snapshot_download(
-            repo_id=hf_source_repo,
-            local_dir=source_dir,
-            local_dir_use_symlinks=False,
-            allow_patterns=["*.gguf"],
-            max_workers=8,
-        )
-    finally:
-        download_done.set()
-        progress_thread.join(timeout=1)
-    downloaded = current_download_size()
+    downloaded = sum(
+        path.stat().st_size for path in Path(source_dir).rglob("*.gguf") if path.is_file()
+    )
     print(f"✅ GGUF download/cache size: {downloaded / (1024**3):.2f} GiB", flush=True)
     results_vol.commit()
 
