@@ -151,6 +151,7 @@ def run_qwen36_mtp_q3ks_quantization(
     threads: int = 16,
 ):
     import subprocess
+    import threading
     from pathlib import Path
 
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
@@ -192,22 +193,63 @@ def run_qwen36_mtp_q3ks_quantization(
     os.chmod(quantize_bin, 0o755)
 
     api = HfApi()
-    gguf_files = [path for path in api.list_repo_files(hf_source_repo) if path.endswith(".gguf")]
-    if not gguf_files:
+    model_info = api.model_info(hf_source_repo, files_metadata=True)
+    gguf_siblings = [
+        sibling for sibling in model_info.siblings if sibling.rfilename.endswith(".gguf")
+    ]
+    if not gguf_siblings:
         raise FileNotFoundError(f"No GGUF files found in Hugging Face repo: {hf_source_repo}")
     print("⬇️ Downloading GGUF files only with hf_transfer enabled:")
-    for gguf_file in gguf_files:
-        print(f"  - {gguf_file}")
+    expected_bytes = 0
+    for sibling in gguf_siblings:
+        size = sibling.size or 0
+        expected_bytes += size
+        size_gib = size / (1024**3) if size else 0.0
+        print(f"  - {sibling.rfilename} ({size_gib:.2f} GiB)")
 
     source_dir = os.path.join(RESULTS_DIR, "hf-snapshots", hf_source_repo.replace("/", "__"))
     os.makedirs(source_dir, exist_ok=True)
-    snapshot_download(
-        repo_id=hf_source_repo,
-        local_dir=source_dir,
-        local_dir_use_symlinks=False,
-        allow_patterns=["*.gguf"],
-        max_workers=8,
-    )
+
+    download_done = threading.Event()
+
+    def current_download_size() -> int:
+        total = 0
+        for path in Path(source_dir).rglob("*"):
+            try:
+                if path.is_file():
+                    total += path.stat().st_size
+            except OSError:
+                pass
+        return total
+
+    def log_download_progress():
+        while not download_done.wait(30):
+            downloaded = current_download_size()
+            if expected_bytes:
+                pct = downloaded / expected_bytes * 100
+                print(
+                    f"⬇️ GGUF download progress: {downloaded / (1024**3):.2f} / "
+                    f"{expected_bytes / (1024**3):.2f} GiB ({pct:.1f}%)",
+                    flush=True,
+                )
+            else:
+                print(f"⬇️ GGUF download progress: {downloaded / (1024**3):.2f} GiB", flush=True)
+
+    progress_thread = threading.Thread(target=log_download_progress, daemon=True)
+    progress_thread.start()
+    try:
+        snapshot_download(
+            repo_id=hf_source_repo,
+            local_dir=source_dir,
+            local_dir_use_symlinks=False,
+            allow_patterns=["*.gguf"],
+            max_workers=8,
+        )
+    finally:
+        download_done.set()
+        progress_thread.join(timeout=1)
+    downloaded = current_download_size()
+    print(f"✅ GGUF download/cache size: {downloaded / (1024**3):.2f} GiB", flush=True)
     results_vol.commit()
 
     source_gguf = find_source_gguf(source_dir)
