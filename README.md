@@ -34,7 +34,7 @@ modal run generate_imatrix.py --rebuild # First run needs --rebuild
 - **`quantize_modal_IQ.py`**: Implements the "Unsloth-style" recipe. It forces critical tensors (attention gates, shared experts) into 8-bit while quantizing the rest to 4-bit.
 - **`quantize_modal_IQS.py`**: Variant for `IQ4_K_S` quantization.
 - **`quantize_modal_IQ3_S.py`**: Multimodal-aware `IQ3_S` recipe with tensor-level overrides (e.g. `ffn_down_exps=IQ3_S`, `ffn_gate_exps/ffn_up_exps=IQ2_S`, key projections in `Q6_K`).
-- **`quantize_qwen36_mtp_q3ks_modal.py`**: ik_llama.cpp-based plain Q3_K_S requantizer for `Radamanthys11/Qwen3.6-27B-MTP-Q8_0-GGUF`, preserving MTP tensors, building the required `llama-quantize` tool on T4, and uploading to the authenticated Hugging Face account by default. This path does not generate or use an imatrix, and disables CUDA compilation because plain quantization does not need GPU kernels.
+- **`quantize_qwen36_mtp_q3ks_modal.py`**: ik_llama.cpp-based Q3_K_S requantizer for `Radamanthys11/Qwen3.6-27B-MTP-Q8_0-GGUF`, preserving `blk.64.*` MTP/nextn tensors as `Q8_0`, building the required `llama-quantize` tool on T4, and uploading to the authenticated Hugging Face account by default. This path does not generate or use an imatrix, enables `hf_transfer`, downloads only GGUF files, and disables CUDA compilation because plain quantization does not need GPU kernels.
 
 ```bash
 modal run quantize_modal_IQ.py --hf-repo username/model-GGUF

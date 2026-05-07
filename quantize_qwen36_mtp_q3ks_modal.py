@@ -11,6 +11,7 @@ image = (
     .apt_install("git", "wget", "cmake", "build-essential", "libcurl4-openssl-dev")
     .pip_install(
         "cmake",
+        "hf_transfer",
         "huggingface-hub",
         "numpy",
         "sentencepiece",
@@ -39,17 +40,24 @@ def default_output_name(source_repo: str) -> str:
 
 
 def custom_q3ks_rules() -> str:
-    # Match the public Q3_K_S-style tensor layout while keeping Qwen hybrid SSM
-    # tensors from being over-quantized.
+    # Keep the MTP/nextn tensors high precision for better speculative-decoding
+    # acceptance. The remaining repeating-layer tensors follow a Q3_K_S-oriented
+    # version of the referenced MTP recipe.
     rules = [
-        r"blk\..*\.ssm_alpha\.weight=f32",
-        r"blk\..*\.ssm_beta\.weight=f32",
-        r"blk\..*\.ssm_conv1d\.weight=f32",
-        r"blk\..*\.ssm_out\.weight=q4_k",
-        r"token_embd\.weight=q3_k",
-        r"output\.weight=q3_k",
-        r"blk\..*\.attn_.*\.weight=q3_k",
-        r"blk\..*\.ffn_.*\.weight=q3_k",
+        r"blk\.64\..*\.weight=q8_0",
+        r"blk\..*\.attn_gate\.weight=q3_k",
+        r"blk\..*\.attn_qkv\.weight=q3_k",
+        r"blk\..*\.attn_output\.weight=q3_k",
+        r"blk\..*\.attn_q\.weight=q3_k",
+        r"blk\..*\.attn_k\.weight=q3_k",
+        r"blk\..*\.attn_v\.weight=q3_k",
+        r"blk\..*\.ssm_alpha\.weight=q6_0",
+        r"blk\..*\.ssm_beta\.weight=q6_0",
+        r"blk\..*\.ssm_out\.weight=q6_0",
+        r"blk\..*\.ffn_down\.weight=q3_k",
+        r"blk\..*\.ffn_(gate|up)\.weight=q3_k",
+        r"token_embd\.weight=q6_0",
+        r"output\.weight=q8_0",
     ]
     return ",".join(rules)
 
@@ -145,6 +153,9 @@ def run_qwen36_mtp_q3ks_quantization(
     import subprocess
     from pathlib import Path
 
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "0")
+
     from huggingface_hub import HfApi, snapshot_download
 
     def run(cmd, *, env=None, cwd=None):
@@ -167,6 +178,9 @@ def run_qwen36_mtp_q3ks_quantization(
                 candidates.append(path)
         if not candidates:
             raise FileNotFoundError(f"No Q8_0 GGUF files found in {source_dir}")
+        for path in sorted(candidates):
+            if "-00001-of-" in path.name:
+                return str(path)
         return str(max(candidates, key=lambda path: path.stat().st_size))
 
     quantize_bin = os.path.join(IK_LLAMA_BIN_DIR, "llama-quantize")
@@ -177,14 +191,22 @@ def run_qwen36_mtp_q3ks_quantization(
         )
     os.chmod(quantize_bin, 0o755)
 
+    api = HfApi()
+    gguf_files = [path for path in api.list_repo_files(hf_source_repo) if path.endswith(".gguf")]
+    if not gguf_files:
+        raise FileNotFoundError(f"No GGUF files found in Hugging Face repo: {hf_source_repo}")
+    print("⬇️ Downloading GGUF files only with hf_transfer enabled:")
+    for gguf_file in gguf_files:
+        print(f"  - {gguf_file}")
+
     source_dir = os.path.join(RESULTS_DIR, "hf-snapshots", hf_source_repo.replace("/", "__"))
     os.makedirs(source_dir, exist_ok=True)
-    print(f"⬇️ Downloading Q8_0 MTP GGUF source from {hf_source_repo}")
     snapshot_download(
         repo_id=hf_source_repo,
         local_dir=source_dir,
         local_dir_use_symlinks=False,
-        allow_patterns=["*.gguf", "*.md", "*.json"],
+        allow_patterns=["*.gguf"],
+        max_workers=8,
     )
     results_vol.commit()
 
@@ -214,7 +236,6 @@ def run_qwen36_mtp_q3ks_quantization(
     else:
         print(f"✅ Reusing existing quantized artifact: {output_path}")
 
-    api = HfApi()
     if not hf_repo:
         username = api.whoami()["name"]
         hf_repo = f"{username}/Qwen3.6-27B-MTP-Q3_K_S-GGUF"
@@ -280,9 +301,11 @@ def run_qwen36_mtp_q3ks_quantization(
 
     Custom tensor overrides:
 
-    - `ssm_alpha.weight`, `ssm_beta.weight`, and `ssm_conv1d.weight`: `F32`
-    - `ssm_out.weight`: `Q4_K`
-    - token embeddings, output tensor, attention weights, and FFN weights: `Q3_K`
+    - `blk.64.*.weight` MTP/nextn tensors: `Q8_0`
+    - `ssm_alpha.weight`, `ssm_beta.weight`, and `ssm_out.weight`: `Q6_0`
+    - token embeddings: `Q6_0`
+    - output tensor: `Q8_0`
+    - attention weights and FFN weights: `Q3_K`
 
     ## Source
 
