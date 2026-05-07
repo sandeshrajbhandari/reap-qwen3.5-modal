@@ -10,6 +10,7 @@ image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12")
     .apt_install("git", "wget", "cmake", "build-essential", "libcurl4-openssl-dev")
     .pip_install(
+        "cmake",
         "huggingface-hub",
         "numpy",
         "sentencepiece",
