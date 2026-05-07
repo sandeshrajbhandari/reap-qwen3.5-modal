@@ -34,6 +34,7 @@ modal run generate_imatrix.py --rebuild # First run needs --rebuild
 - **`quantize_modal_IQ.py`**: Implements the "Unsloth-style" recipe. It forces critical tensors (attention gates, shared experts) into 8-bit while quantizing the rest to 4-bit.
 - **`quantize_modal_IQS.py`**: Variant for `IQ4_K_S` quantization.
 - **`quantize_modal_IQ3_S.py`**: Multimodal-aware `IQ3_S` recipe with tensor-level overrides (e.g. `ffn_down_exps=IQ3_S`, `ffn_gate_exps/ffn_up_exps=IQ2_S`, key projections in `Q6_K`).
+- **`quantize_qwen36_mtp_q3ks_modal.py`**: ik_llama.cpp-based Q3_K_S requantizer for `Radamanthys11/Qwen3.6-27B-MTP-Q8_0-GGUF`, preserving MTP tensors and uploading to the authenticated Hugging Face account by default.
 
 ```bash
 modal run quantize_modal_IQ.py --hf-repo username/model-GGUF
@@ -46,6 +47,11 @@ modal run quantize_modal_IQ3_S.py \
   --generate-imatrix-if-missing true \
   --mmproj-quant "f16" \
   --hf-repo username/model-IQ3S-GGUF
+```
+
+```bash
+modal run quantize_qwen36_mtp_q3ks_modal.py \
+  --hf-repo username/Qwen3.6-27B-MTP-Q3_K_S-GGUF
 ```
 
 For multimodal checkpoints, keep/use a matching `mmproj` file. The script now handles this flow:
