@@ -41,21 +41,12 @@ def default_output_name(source_repo: str) -> str:
 
 def custom_q3ks_rules() -> str:
     # Keep the MTP/nextn tensors high precision for better speculative-decoding
-    # acceptance. The remaining repeating-layer tensors follow a Q3_K_S-oriented
-    # version of the referenced MTP recipe.
+    # acceptance. The global Q3_K_S output type handles normal repeating tensors.
     rules = [
         r"blk\.64\..*\.weight=q8_0",
-        r"blk\..*\.attn_gate\.weight=q3_k",
-        r"blk\..*\.attn_qkv\.weight=q3_k",
-        r"blk\..*\.attn_output\.weight=q3_k",
-        r"blk\..*\.attn_q\.weight=q3_k",
-        r"blk\..*\.attn_k\.weight=q3_k",
-        r"blk\..*\.attn_v\.weight=q3_k",
         r"blk\..*\.ssm_alpha\.weight=q6_0",
         r"blk\..*\.ssm_beta\.weight=q6_0",
         r"blk\..*\.ssm_out\.weight=q6_0",
-        r"blk\..*\.ffn_down\.weight=q3_k",
-        r"blk\..*\.ffn_(gate|up)\.weight=q3_k",
         r"token_embd\.weight=q6_0",
         r"output\.weight=q8_0",
     ]
@@ -355,7 +346,7 @@ def run_qwen36_mtp_q3ks_quantization(
     - `ssm_alpha.weight`, `ssm_beta.weight`, and `ssm_out.weight`: `Q6_0`
     - token embeddings: `Q6_0`
     - output tensor: `Q8_0`
-    - attention weights and FFN weights: `Q3_K`
+    - normal repeating tensors: global `Q3_K_S`
 
     ## Source
 
