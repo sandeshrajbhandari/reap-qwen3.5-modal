@@ -101,10 +101,9 @@ def build_ik_llama_cpp(force_rebuild_ik_llama: bool = False, threads: int = 16):
             IK_LLAMA_DIR,
             "-B",
             IK_LLAMA_BUILD_DIR,
-            "-DGGML_CUDA=ON",
+            "-DGGML_CUDA=OFF",
             "-DLLAMA_CURL=ON",
             "-DCMAKE_BUILD_TYPE=Release",
-            "-DCMAKE_CUDA_ARCHITECTURES=75;80",
         ]
     )
     run(
@@ -125,7 +124,7 @@ def build_ik_llama_cpp(force_rebuild_ik_llama: bool = False, threads: int = 16):
         raise FileNotFoundError(f"ik_llama.cpp build did not produce {quantize_bin}")
     os.chmod(quantize_bin, 0o755)
     results_vol.commit()
-    print(f"🎉 ik_llama.cpp T4 build ready: {quantize_bin}")
+    print(f"🎉 ik_llama.cpp CPU quantizer build on T4 is ready: {quantize_bin}")
 
 
 @app.function(
