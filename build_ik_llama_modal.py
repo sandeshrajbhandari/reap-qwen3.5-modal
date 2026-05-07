@@ -54,8 +54,7 @@ def build_smoke_test_and_upload(
     hf_repo: str,
     llama_ref: str = "main",
     llama_repo_url: str = "https://github.com/ikawrakow/ik_llama.cpp.git",
-    artifact_prefix: str = "ik-llama-cpp-cuda-allarch-colab",
-    cuda_architectures: str = "75;80;86;87;89;90",
+    artifact_prefix: str = "ik-llama-cpp-cuda-default-colab",
     run_smoke_test: bool = True,
     demo_model_repo: str = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
     demo_model_file: str = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
@@ -121,34 +120,24 @@ def build_smoke_test_and_upload(
     cmake_version = subprocess.check_output(["cmake", "--version"]).decode().strip()
     print(cmake_version)
 
-    os.makedirs(build_dir, exist_ok=True)
-    cmake_flags = [
-        "-DCMAKE_BUILD_TYPE=Release",
+    configure_cmd = [
+        "cmake",
+        "-B",
+        "build",
         "-DGGML_NATIVE=ON",
         "-DGGML_CUDA=ON",
-        "-DLLAMA_CURL=ON",
-        "-DBUILD_SHARED_LIBS=ON",
-        "-DCMAKE_BUILD_RPATH=$ORIGIN",
-        f"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}",
     ]
-    subprocess.run(
-        ["cmake", "-S", str(source_dir), "-B", str(build_dir), *cmake_flags],
-        check=True,
-    )
-    subprocess.run(
-        [
-            "cmake",
-            "--build",
-            str(build_dir),
-            "--config",
-            "Release",
-            "--target",
-            *CORE_BINARIES,
-            "-j",
-            "16",
-        ],
-        check=True,
-    )
+    build_cmd = [
+        "cmake",
+        "--build",
+        "build",
+        "--config",
+        "Release",
+        "-j",
+        str(os.cpu_count() or 1),
+    ]
+    subprocess.run(configure_cmd, cwd=source_dir, check=True)
+    subprocess.run(build_cmd, cwd=source_dir, check=True)
 
     bin_root = build_dir / "bin"
     missing_bins = [name for name in CORE_BINARIES if not (bin_root / name).exists()]
@@ -197,10 +186,16 @@ def build_smoke_test_and_upload(
             shutil.copy2(src, dst)
             copied_files.append(dst)
 
+    run_env = os.environ.copy()
+    run_env["LD_LIBRARY_PATH"] = (
+        f"{binaries_dir}:{run_env.get('LD_LIBRARY_PATH', '')}"
+    ).rstrip(":")
+
     version_output = subprocess.run(
         [str(binaries_dir / "llama-cli"), "--version"],
         capture_output=True,
         check=True,
+        env=run_env,
         text=True,
     )
     print(version_output.stderr)
@@ -225,7 +220,12 @@ def build_smoke_test_and_upload(
             "Write one short sentence confirming this CUDA build works.",
         ]
         print(f"Running CUDA smoke test: {' '.join(smoke_cmd)}")
-        smoke_result = subprocess.run(smoke_cmd, capture_output=True, text=True)
+        smoke_result = subprocess.run(
+            smoke_cmd,
+            capture_output=True,
+            env=run_env,
+            text=True,
+        )
         smoke_test = {
             "command": smoke_cmd,
             "returncode": smoke_result.returncode,
@@ -249,8 +249,8 @@ def build_smoke_test_and_upload(
         "source_commit_short": short_sha,
         "built_at_utc": datetime.datetime.utcnow().isoformat() + "Z",
         "builder_gpu_type": "T4",
-        "cuda_architectures": cuda_architectures,
-        "cmake_flags": cmake_flags,
+        "configure_command": configure_cmd,
+        "build_command": build_cmd,
         "cmake_version": cmake_version,
         "binaries": CORE_BINARIES,
         "shared_libraries": shared_libraries,
@@ -312,8 +312,7 @@ def main(
     hf_repo: str = "sandeshrajx/llama_cpp_colab_builds",
     llama_ref: str = "main",
     llama_repo_url: str = "https://github.com/ikawrakow/ik_llama.cpp.git",
-    artifact_prefix: str = "ik-llama-cpp-cuda-allarch-colab",
-    cuda_architectures: str = "75;80;86;87;89;90",
+    artifact_prefix: str = "ik-llama-cpp-cuda-default-colab",
     run_smoke_test: bool = True,
     demo_model_repo: str = "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
     demo_model_file: str = "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
@@ -323,7 +322,6 @@ def main(
         llama_ref=llama_ref,
         llama_repo_url=llama_repo_url,
         artifact_prefix=artifact_prefix,
-        cuda_architectures=cuda_architectures,
         run_smoke_test=run_smoke_test,
         demo_model_repo=demo_model_repo,
         demo_model_file=demo_model_file,
