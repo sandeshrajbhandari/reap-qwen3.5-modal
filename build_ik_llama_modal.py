@@ -127,7 +127,8 @@ def build_smoke_test_and_upload(
         "-DGGML_NATIVE=ON",
         "-DGGML_CUDA=ON",
         "-DLLAMA_CURL=ON",
-        "-DBUILD_SHARED_LIBS=OFF",
+        "-DBUILD_SHARED_LIBS=ON",
+        "-DCMAKE_BUILD_RPATH=$ORIGIN",
         f"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}",
     ]
     subprocess.run(
@@ -169,6 +170,18 @@ def build_smoke_test_and_upload(
         shutil.copy2(src, dst)
         os.chmod(dst, 0o755)
         copied_files.append(dst)
+
+    shared_libraries: list[str] = []
+    for src in sorted(build_dir.rglob("*.so*")):
+        if not src.is_file():
+            continue
+        dst = binaries_dir / src.name
+        if dst.exists():
+            continue
+        print(f"  - {src.name}")
+        shutil.copy2(src, dst)
+        copied_files.append(dst)
+        shared_libraries.append(src.name)
 
     for script_name in CONVERT_SCRIPTS:
         src = source_dir / script_name
@@ -240,6 +253,7 @@ def build_smoke_test_and_upload(
         "cmake_flags": cmake_flags,
         "cmake_version": cmake_version,
         "binaries": CORE_BINARIES,
+        "shared_libraries": shared_libraries,
         "version_stderr": version_output.stderr,
         "smoke_test": smoke_test,
     }
