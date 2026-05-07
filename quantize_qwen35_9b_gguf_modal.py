@@ -18,9 +18,9 @@ image = (
         "protobuf",
         "safetensors",
         "sentencepiece",
-        "torch",
         "transformers",
     )
+    .run_commands("pip install --index-url https://download.pytorch.org/whl/cpu torch")
 )
 
 results_vol = modal.Volume.from_name("reap-results")
