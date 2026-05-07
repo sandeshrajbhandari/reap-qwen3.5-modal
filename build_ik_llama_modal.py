@@ -24,7 +24,7 @@ image = (
         "libgomp1",
         "zip",
     )
-    .pip_install("huggingface-hub")
+    .pip_install("cmake", "huggingface-hub")
 )
 
 
@@ -118,6 +118,8 @@ def build_smoke_test_and_upload(
         .strip()
     )
     print(f"Building ik_llama.cpp commit {short_sha}")
+    cmake_version = subprocess.check_output(["cmake", "--version"]).decode().strip()
+    print(cmake_version)
 
     os.makedirs(build_dir, exist_ok=True)
     cmake_flags = [
@@ -226,6 +228,7 @@ def build_smoke_test_and_upload(
         "builder_gpu_type": "T4",
         "cuda_architectures": cuda_architectures,
         "cmake_flags": cmake_flags,
+        "cmake_version": cmake_version,
         "binaries": CORE_BINARIES,
         "version_stderr": version_output.stderr,
         "smoke_test": smoke_test,
