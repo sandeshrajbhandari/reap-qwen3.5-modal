@@ -116,9 +116,8 @@ def run_qwen36_mtp_q3ks_quantization(
             run(["git", "clone", IK_LLAMA_REPO, IK_LLAMA_DIR])
         else:
             print(f"🔄 Updating existing ik_llama.cpp checkout: {IK_LLAMA_DIR}")
-            run(["git", "fetch", "--depth", "1", "origin", "master"], cwd=IK_LLAMA_DIR)
-            run(["git", "checkout", "master"], cwd=IK_LLAMA_DIR)
-            run(["git", "pull", "--ff-only", "origin", "master"], cwd=IK_LLAMA_DIR)
+            run(["git", "fetch", "--depth", "1", "origin"], cwd=IK_LLAMA_DIR)
+            run(["git", "pull", "--ff-only"], cwd=IK_LLAMA_DIR)
 
         os.makedirs(IK_LLAMA_BUILD_DIR, exist_ok=True)
         run(
