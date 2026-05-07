@@ -7,7 +7,7 @@ import modal
 app = modal.App("qwen36-mtp-q3ks-quantizer")
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12")
+    modal.Image.from_registry("ubuntu:22.04", add_python="3.12")
     .apt_install("aria2", "git", "wget", "cmake", "build-essential", "libcurl4-openssl-dev")
     .pip_install(
         "cmake",
@@ -64,7 +64,6 @@ def custom_q3ks_rules() -> str:
 
 @app.function(
     image=image,
-    gpu="T4",
     volumes={RESULTS_DIR: results_vol},
     timeout=14400,
 )
@@ -137,7 +136,6 @@ def build_ik_llama_cpp(force_rebuild_ik_llama: bool = False, threads: int = 16):
 
 @app.function(
     image=image,
-    gpu="T4",
     volumes={RESULTS_DIR: results_vol},
     secrets=[modal.Secret.from_name("huggingface-secret")],
     timeout=43200,
