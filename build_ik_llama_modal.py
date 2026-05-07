@@ -135,7 +135,17 @@ def build_smoke_test_and_upload(
         check=True,
     )
     subprocess.run(
-        ["cmake", "--build", str(build_dir), "--config", "Release", "-j", "16"],
+        [
+            "cmake",
+            "--build",
+            str(build_dir),
+            "--config",
+            "Release",
+            "--target",
+            *CORE_BINARIES,
+            "-j",
+            "16",
+        ],
         check=True,
     )
 
