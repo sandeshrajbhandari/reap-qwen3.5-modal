@@ -8,7 +8,7 @@ app = modal.App("qwen36-mtp-q3ks-quantizer")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12")
-    .apt_install("git", "wget", "cmake", "build-essential", "libcurl4-openssl-dev")
+    .apt_install("aria2", "git", "wget", "cmake", "build-essential", "libcurl4-openssl-dev")
     .pip_install(
         "cmake",
         "hf_transfer",
@@ -233,22 +233,28 @@ def run_qwen36_mtp_q3ks_quantization(
             continue
 
         url = f"https://huggingface.co/{hf_source_repo}/resolve/main/{quote(sibling.rfilename)}"
-        wget_cmd = [
-            "wget",
-            "--continue",
-            "--progress=dot:giga",
-            "--tries=20",
+        download_cmd = [
+            "aria2c",
+            "--continue=true",
+            "--file-allocation=none",
+            "--max-connection-per-server=16",
+            "--split=16",
+            "--min-split-size=1M",
+            "--max-tries=20",
+            "--retry-wait=5",
             "--timeout=30",
-            "--read-timeout=30",
-            "--waitretry=5",
-            "-O",
-            target_path,
+            "--summary-interval=30",
+            "--console-log-level=notice",
+            "--dir",
+            os.path.dirname(target_path),
+            "--out",
+            os.path.basename(target_path),
             url,
         ]
         if token:
-            wget_cmd.insert(1, f"--header=Authorization: Bearer {token}")
-        print(f"⬇️ Resumable direct GGUF download: {sibling.rfilename}", flush=True)
-        run(wget_cmd)
+            download_cmd.insert(1, f"--header=Authorization: Bearer {token}")
+        print(f"⬇️ Multi-connection resumable GGUF download: {sibling.rfilename}", flush=True)
+        run(download_cmd)
 
     downloaded = sum(
         path.stat().st_size for path in Path(source_dir).rglob("*.gguf") if path.is_file()
