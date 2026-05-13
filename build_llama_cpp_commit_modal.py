@@ -104,6 +104,7 @@ def build_smoke_test_and_upload(
     if source_dir.exists():
         shutil.rmtree(source_dir)
     subprocess.run(["git", "clone", llama_repo_url, str(source_dir)], check=True)
+    subprocess.run(["git", "fetch", "origin", llama_ref], check=True, cwd=source_dir)
     subprocess.run(["git", "checkout", llama_ref], check=True, cwd=source_dir)
 
     short_sha = (
